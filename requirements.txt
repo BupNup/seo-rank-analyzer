@@ -6,3 +6,4 @@ chardet
 python-dateutil
 scipy
 scikit-learn
+sentence-transformers
