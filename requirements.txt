@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+networkx
+chardet
+python-dateutil
