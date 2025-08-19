@@ -25,7 +25,7 @@ Find low PageRank or orphan pages, then identify the best internal pages to link
   2) Screaming Frog **All Inlinks**  
   3) **Ahrefs Backlinks**  
   4) **Google Search Console** (GSC) query export  
-- Builds an **internal-only link graph**. Your **homepage URL** defines the domain scope. External links are removed. The homepage is excluded as a source for suggestions.
+- Builds an **internal-only link graph**. Your **homepage URL** defines the domain scope. External links are removed.
 - Computes **PageRank** (page importance) and **CheiRank** (hubness). CheiRank = PageRank on the reversed graph.
 - Understands topics from **GSC queries + Title + Meta Description + H1 + H2**. Default similarity engine is **TF-IDF**. **Embeddings** are optional.
 - Assigns **categories** to each URL by comparing its text (URL path + Title + Description) to your category list.
