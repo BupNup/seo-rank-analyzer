@@ -1,9 +1,22 @@
 
+"""
+SEO PageRank & CheiRank Analyzer – Streamlit App (v2)
+- Upload Screaming Frog HTML pages, All Inlinks, and Ahrefs backlinks
+- Compute PageRank (internal), CheiRank (reverse)
+- Classify and optionally exclude header/footer/nav links
+- Aggregate Ahrefs grouped backlinks ("Links in group") as personalization
+- Optional GSC export to improve semantic matching
+- Generate internal link suggestions per target page
+
+Run:
+    pip install -r requirements.txt
+    streamlit run seo_rank_analyzer_v2.py
+"""
+
 from __future__ import annotations
 import io
 import re
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import chardet
 import numpy as np
@@ -15,13 +28,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 DEFAULT_PAGERANK_ALPHA = 0.85
 
-URL_COL_CANDIDATES_PAGES = ["Address", "URL", "Url", "address", "Final URL", "Final Address"]
+# Column candidates
+URL_COL_CANDIDATES_PAGES = [
+    "Address", "URL", "Url", "address", "Final URL", "Final Address",
+]
 INLINKS_SRC_CANDIDATES = ["Source", "From", "From URL", "From Address", "source"]
 INLINKS_DST_CANDIDATES = ["Destination", "To", "Target", "Target URL", "To URL", "To Address"]
 AHREFS_TARGET_CANDIDATES = ["Target URL", "Target url", "URL", "Address"]
 AHREFS_REFERRING_PAGE_CANDS = ["Referring page URL", "Referring Page", "Source URL", "Backlink URL"]
 AHREFS_REFERRING_DOMAIN_CANDS = ["Referring domain", "Referring Domain", "Domain"]
 
+# GSC + meta candidates
 GSC_PAGE_CANDS = ["Page","Landing page","Landing Page","URL","Address"]
 GSC_QUERY_CANDS = ["Query","Search query","Search Query"]
 GSC_IMPR_CANDS = ["Impressions","Impr","Impressions Total"]
@@ -30,6 +47,9 @@ PAGE_TITLE_CANDS = ["Title 1","Title","Meta Title"]
 PAGE_DESC_CANDS = ["Meta Description 1","Meta Description"]
 PAGE_H1_CANDS   = ["H1-1","H1"]
 
+# ---------------------------------
+# IO helpers
+# ---------------------------------
 @st.cache_data(show_spinner=False)
 def sniff_encoding(file_bytes: bytes) -> str:
     res = chardet.detect(file_bytes)
@@ -60,6 +80,9 @@ def read_gsc(uploaded_file) -> pd.DataFrame:
         df = pd.read_excel(buf)
     return df
 
+# ---------------------------------
+# URL utils
+# ---------------------------------
 def _strip_fragment(url: str) -> str:
     return url.split('#', 1)[0]
 
@@ -71,29 +94,28 @@ def normalize_url(url: str, keep_query: bool = False) -> str:
     if not isinstance(url, str):
         return ""
     u = url.strip().lower()
-    if not u: return ""
-    u = _strip_fragment(u); u = _strip_query(u, keep_query)
+    if not u:
+        return ""
+    u = _strip_fragment(u)
+    u = _strip_query(u, keep_query)
     if u.endswith('/'):
         m = re.match(r"^(https?://[^/]+)/$", u)
-        if not m: u = u[:-1]
+        if not m:
+            u = u[:-1]
     return u
 
 def pick_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols_lower = {c.lower(): c for c in df.columns}
     for cand in candidates:
-        if cand in df.columns: return cand
-        if cand.lower() in cols_lower: return cols_lower[cand.lower()]
+        if cand in df.columns:
+            return cand
+        if cand.lower() in cols_lower:
+            return cols_lower[cand.lower()]
     return None
 
-def get_host(u: str) -> str:
-    try: return urlparse(u).netloc.lower()
-    except Exception: return ""
-
-def is_internal_host(host: str, roots: List[str]) -> bool:
-    if not roots: return True
-    h = host.lower()
-    return any(h.endswith(r.strip().lower()) for r in roots if r.strip())
-
+# ---------------------------------
+# Inlinks classification (contextual vs menu/footer)
+# ---------------------------------
 def detect_link_position_columns(df: pd.DataFrame):
     pos = pick_column(df, ["Link Position","Position","Placement"])
     path = pick_column(df, ["Link Path","DOM Path","XPath"])
@@ -112,14 +134,18 @@ def classify_inlink_row(row: pd.Series, pos_col: Optional[str], path_col: Option
         return "menu_footer"
     if "content" in pos or "main" in pos:
         return "contextual"
+
     if any(tok in path for tok in ["/header","/nav","/footer","/aside","breadcrumb","sidebar","menu","mega-menu","pagination","pager"]):
         return "menu_footer"
     if any(tok in elem for tok in ["nav","header","footer","aside","breadcrumb"]):
         return "menu_footer"
     if any(tok in path for tok in ["/main","/article","/section","/content"]) or any(tok in elem for tok in ["main","article","section"]):
         return "contextual"
+
     generic = {"home","about","contact","login","register","sign in","sign up","terms","privacy","blog","categories","slots","casinos"}
-    if anch in generic or len(anch) <= 2: return "menu_footer"
+    if anch in generic or len(anch) <= 2:
+        return "menu_footer"
+
     return "other"
 
 def filter_inlinks_by_scope(inlinks: pd.DataFrame, scope: str) -> pd.DataFrame:
@@ -135,49 +161,56 @@ def filter_inlinks_by_scope(inlinks: pd.DataFrame, scope: str) -> pd.DataFrame:
         return tmp[tmp['_cls'] == 'menu_footer'].drop(columns=['_cls'])
     return inlinks
 
-def build_internal_graph(pages: pd.DataFrame, inlinks: pd.DataFrame, keep_query: bool, link_scope: str = 'all', root_domains: Optional[List[str]] = None) -> Tuple[nx.DiGraph, pd.DataFrame]:
+# ---------------------------------
+# Graph build & backlinks aggregate
+# ---------------------------------
+def build_internal_graph(pages: pd.DataFrame, inlinks: pd.DataFrame, keep_query: bool, link_scope: str = 'all') -> Tuple[nx.DiGraph, pd.DataFrame]:
     url_col = pick_column(pages, URL_COL_CANDIDATES_PAGES)
-    if not url_col: raise ValueError("Pages file needs a URL column like 'Address' or 'URL'.")
+    if not url_col:
+        raise ValueError("Pages file needs a URL column like 'Address' or 'URL'.")
     pages = pages.copy()
     pages['url_norm'] = pages[url_col].map(lambda x: normalize_url(x, keep_query))
-    pages['host'] = pages['url_norm'].map(get_host)
-    roots = root_domains or []
-    if roots:
-        pages = pages[pages['host'].map(lambda h: is_internal_host(h, roots))]
     pages_nodes = pages['url_norm'].dropna().drop_duplicates()
     pages_nodes = pages_nodes[pages_nodes != ""]
 
     src_col = pick_column(inlinks, INLINKS_SRC_CANDIDATES)
     dst_col = pick_column(inlinks, INLINKS_DST_CANDIDATES)
-    if not src_col or not dst_col: raise ValueError("Inlinks file needs columns like 'Source' and 'Destination'.")
+    if not src_col or not dst_col:
+        raise ValueError("Inlinks file needs columns like 'Source' and 'Destination'.")
 
     inlinks = inlinks.copy()
     inlinks['src'] = inlinks[src_col].map(lambda x: normalize_url(x, keep_query))
     inlinks['dst'] = inlinks[dst_col].map(lambda x: normalize_url(x, keep_query))
-    inlinks['src_host'] = inlinks['src'].map(get_host)
-    inlinks['dst_host'] = inlinks['dst'].map(get_host)
 
-    # Apply scope filter then internal-only filter
+    # Filter by scope (drop header/footer if contextual)
     inlinks = filter_inlinks_by_scope(inlinks, link_scope)
-    if roots:
-        inlinks = inlinks[inlinks['src_host'].map(lambda h: is_internal_host(h, roots)) & inlinks['dst_host'].map(lambda h: is_internal_host(h, roots))]
 
+    # Keep edges that target known nodes
     valid_nodes = set(pages_nodes.tolist())
     df_edges = inlinks[['src','dst']].dropna()
     df_edges = df_edges[(df_edges['src'] != "") & (df_edges['dst'] != "")]
     df_edges = df_edges[df_edges['dst'].isin(valid_nodes) & df_edges['src'].isin(valid_nodes)]
+
+    # Weight by multiplicity (aggregate duplicates)
     df_edges['weight'] = 1.0
     df_edges = df_edges.groupby(['src','dst'], as_index=False)['weight'].sum()
 
-    G = nx.DiGraph(); G.add_nodes_from(valid_nodes)
+    # Build graph
+    G = nx.DiGraph()
+    G.add_nodes_from(valid_nodes)
     for row in df_edges.itertuples(index=False):
         G.add_edge(row.src, row.dst, weight=float(row.weight))
+
     return G, pages
 
 def aggregate_backlinks(backlinks: pd.DataFrame, keep_query: bool) -> pd.Series:
-    if backlinks is None or backlinks.empty: return pd.Series(dtype=float)
+    if backlinks is None or backlinks.empty:
+        return pd.Series(dtype=float)
+
     tgt_col = pick_column(backlinks, AHREFS_TARGET_CANDIDATES)
-    if not tgt_col: raise ValueError("Backlinks file needs a 'Target URL' or similar column.")
+    if not tgt_col:
+        raise ValueError("Backlinks file needs a 'Target URL' or similar column.")
+
     df = backlinks.copy()
     df['target'] = df[tgt_col].map(lambda x: normalize_url(x, keep_query))
 
@@ -203,11 +236,15 @@ def aggregate_backlinks(backlinks: pd.DataFrame, keep_query: bool) -> pd.Series:
     counts = agg.groupby('target')['ref_key'].nunique().astype(float)
     return counts
 
+# ---------------------------------
+# Ranks
+# ---------------------------------
 def compute_pagerank(G: nx.DiGraph, alpha: float, personalization: Optional[Dict[str, float]] = None) -> Dict[str, float]:
     if G.number_of_edges() == 0:
         n = G.number_of_nodes()
         if n == 0: return {}
-        uni = 1.0 / n; return {node: uni for node in G.nodes}
+        uni = 1.0 / n
+        return {node: uni for node in G.nodes}
     try:
         return nx.pagerank(G, alpha=alpha, weight='weight', personalization=personalization)
     except nx.PowerIterationFailedConvergence:
@@ -217,12 +254,17 @@ def compute_cheirank(G: nx.DiGraph, alpha: float) -> Dict[str, float]:
     GR = G.reverse(copy=True)
     return compute_pagerank(GR, alpha=alpha, personalization=None)
 
+# ---------------------------------
+# Semantics (GSC + SF)
+# ---------------------------------
 def build_gsc_semantics(gsc: pd.DataFrame, keep_query: bool) -> pd.Series:
-    if gsc is None or gsc.empty: return pd.Series(dtype=str)
+    if gsc is None or gsc.empty:
+        return pd.Series(dtype=str)
     pg_col = pick_column(gsc, GSC_PAGE_CANDS)
     q_col  = pick_column(gsc, GSC_QUERY_CANDS)
     i_col  = pick_column(gsc, GSC_IMPR_CANDS)
-    if not (pg_col and q_col and i_col): return pd.Series(dtype=str)
+    if not (pg_col and q_col and i_col):
+        return pd.Series(dtype=str)
     tmp = gsc[[pg_col, q_col, i_col]].rename(columns={pg_col:"page", q_col:"query", i_col:"impr"}).copy()
     tmp['page'] = tmp['page'].map(lambda x: normalize_url(x, keep_query))
     tmp['query'] = tmp['query'].astype(str).str.lower().str.replace(r"[^a-z0-9\-\s]"," ", regex=True)
@@ -234,9 +276,7 @@ def build_gsc_semantics(gsc: pd.DataFrame, keep_query: bool) -> pd.Series:
 def build_page_texts(df_pages: pd.DataFrame, gsc_sem: pd.Series) -> Dict[str, str]:
     url_col = pick_column(df_pages, URL_COL_CANDIDATES_PAGES)
     t_col = pick_column(df_pages, PAGE_TITLE_CANDS)
-    d_col = pick_column(df_pages, PAGE_DESC_CANDIDATES) if 'PAGE_DESC_CANDIDATES' in globals() else None
-    if d_col is None:
-        d_col = pick_column(df_pages, ["Meta Description 1","Meta Description"])
+    d_col = pick_column(df_pages, PAGE_DESC_CANDS)
     h1_col = pick_column(df_pages, PAGE_H1_CANDS)
     h2_cols = [c for c in df_pages.columns if str(c).startswith('H2')]
 
@@ -249,8 +289,10 @@ def build_page_texts(df_pages: pd.DataFrame, gsc_sem: pd.Series) -> Dict[str, st
         if t_col: parts.append(str(row.get(t_col, "")))
         if d_col: parts.append(str(row.get(d_col, "")))
         if h1_col: parts.append(str(row.get(h1_col, "")))
-        for c in h2_cols[:6]: parts.append(str(row.get(c, "")))
-        if isinstance(gsc_sem, pd.Series) and u in gsc_sem.index: parts.append(str(gsc_sem[u]))
+        for c in h2_cols[:6]:
+            parts.append(str(row.get(c, "")))
+        if isinstance(gsc_sem, pd.Series) and u in gsc_sem.index:
+            parts.append(str(gsc_sem[u]))
         texts[u] = ' '.join([p for p in parts if isinstance(p, str)]).lower()
     return texts
 
@@ -261,32 +303,13 @@ def tfidf_similarity(texts: Dict[str,str], urls: List[str]):
     index = {u:i for i,u in enumerate(urls)}
     return vec, X, index
 
-def slugify(s: str) -> str:
-    return re.sub(r"[^a-z0-9\-]+","-", s.strip().lower()).strip("-")
-
-def assign_categories(df_pages: pd.DataFrame, categories: List[str], texts: Dict[str,str]) -> Dict[str, str]:
-    if not categories: return {}
-    url_col = pick_column(df_pages, URL_COL_CANDIDATES_PAGES)
-    cat_slugs = [(c, slugify(c)) for c in categories]
-    mapping = {}
-    for _, row in df_pages.iterrows():
-        u = normalize_url(str(row.get(url_col, "")), keep_query=False)
-        if not u: continue
-        text = texts.get(u, "")
-        picked = ""
-        for label, slug in cat_slugs:
-            if f"/{slug}/" in u or u.endswith(f"/{slug}") or slug in text:
-                picked = label; break
-        mapping[u] = picked
-    return mapping
-
-def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], category_map: Dict[str,str],
-                           prefer_same_category: bool, same_category_only: bool,
+def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str],
                            backlink_weight: float = 0.15, pr_weight: float = 0.35,
                            ch_weight: float = 0.15, sem_weight: float = 0.35,
                            low_pr_q: float = 0.20, top_k_sources: int = 5) -> pd.DataFrame:
     df = df_metrics.copy()
     low_pr_thresh = df['pagerank'].quantile(low_pr_q)
+
     df['reason'] = ''
     df.loc[df['inlinks'] == 0, 'reason'] = df['reason'] + 'Orphan; '
     df.loc[df['pagerank'] <= low_pr_thresh, 'reason'] = df['reason'] + 'Low PR; '
@@ -294,13 +317,14 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
     df['reason'] = df['reason'].str.strip()
     targets = df[df['reason'] != ''].copy()
     if targets.empty:
-        return pd.DataFrame(columns=['target','category','reason','pagerank','cheirank','backlinks','inlinks','anchor_hint','suggestions'])
+        return pd.DataFrame(columns=['target','reason','pagerank','cheirank','backlinks','inlinks','anchor_hint','suggestions'])
 
     urls = [u for u in df['url'] if u in texts]
     if not urls:
-        return pd.DataFrame(columns=['target','category','reason','pagerank','cheirank','backlinks','inlinks','anchor_hint','suggestions'])
+        return pd.DataFrame(columns=['target','reason','pagerank','cheirank','backlinks','inlinks','anchor_hint','suggestions'])
 
     _, X, idx = tfidf_similarity(texts, urls)
+
     pr_norm = (df.set_index('url')['pagerank_norm']).reindex(urls).fillna(0.0).to_numpy()
     ch_norm = (df.set_index('url')['cheirank_norm']).reindex(urls).fillna(0.0).to_numpy()
     bln = (df.set_index('url')['backlinks_refcnt']).reindex(urls).fillna(0.0)
@@ -312,7 +336,8 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
     for t in targets.itertuples(index=False):
         t_url = t.url
-        if t_url not in idx: continue
+        if t_url not in idx:
+            continue
         t_vec = X[idx[t_url]]
         sims = cosine_similarity(t_vec, X).ravel()
 
@@ -323,26 +348,18 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
         score = np.where(mask, score, -1)
         score = np.where(out_deg > 0, score, score * 0.5)
 
-        t_cat = category_map.get(t_url, "")
-        if same_category_only and t_cat:
-            same_mask = np.array([category_map.get(u, "") == t_cat for u in urls])
-            score = np.where(same_mask, score, -1)
-        elif prefer_same_category and t_cat:
-            same_mask = np.array([category_map.get(u, "") == t_cat for u in urls])
-            score = np.where(same_mask, score * 1.15, score)  # bonus if same category
-
         top_idx = score.argsort()[::-1][:top_k_sources]
         cands = []
         for j in top_idx:
-            cands.append(f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cat={category_map.get(urls[j],'')}")
+            cands.append(f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f}")
 
+        # Anchor hint: top tokens from target text
         tokens = [w for w in re.findall(r"[a-z0-9\-]+", texts.get(t_url, "")) if len(w) > 2]
         common = [w for w,_ in Counter(tokens).most_common(8)]
         anchor = ' '.join(common[:4])
 
         rows.append({
             'target': t_url,
-            'category': t_cat,
             'reason': t.reason,
             'pagerank': t.pagerank,
             'cheirank': t.cheirank,
@@ -354,7 +371,11 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
     return pd.DataFrame(rows)
 
-def flag_pages(df: pd.DataFrame, pr_col: str, ch_col: str, backlink_col: str, low_pr_q: float, high_ch_q: float) -> pd.DataFrame:
+# ---------------------------------
+# Flags (basic labeling for UI)
+# ---------------------------------
+def flag_pages(df: pd.DataFrame, pr_col: str, ch_col: str, backlink_col: str,
+               low_pr_q: float, high_ch_q: float) -> pd.DataFrame:
     df = df.copy()
     if len(df) == 0: return df
     pr_thresh = df[pr_col].quantile(low_pr_q) if df[pr_col].notna().any() else 0.0
@@ -370,33 +391,32 @@ def flag_pages(df: pd.DataFrame, pr_col: str, ch_col: str, backlink_col: str, lo
     df['flags'] = flags
     return df
 
+# ---------------------------------
 # UI
+# ---------------------------------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v3)")
+st.title("SEO PageRank & CheiRank Analyzer")
 
 with st.sidebar:
     st.header("Settings")
-    root_domains_s = st.text_input("Root domain(s)", value="", help="Comma-separated, e.g. example.com, example.co.uk. Only links within these will count.")
-    root_domains = [d.strip() for d in re.split(r"[,\\s]+", root_domains_s) if d.strip()]
-
-    categories_s = st.text_area("Main categories (one per line or comma-separated)", value="")
-    categories = [c.strip() for c in re.split(r"[\\n,]+", categories_s) if c.strip()]
-    prefer_same_category = st.checkbox("Prefer same-category sources", value=True)
-    same_category_only = st.checkbox("Restrict to same category only", value=False)
-
-    link_scope = st.selectbox("Which links should count for PR?", options=["all","contextual","menu_footer"], index=1)
     keep_query = st.checkbox("Keep URL query parameters", value=False)
     alpha = st.slider("PageRank damping (alpha)", 0.50, 0.99, DEFAULT_PAGERANK_ALPHA, 0.01)
+    link_scope = st.selectbox("Which links should count for PR?", options=["all","contextual","menu_footer"], index=1)
     use_backlinks = st.checkbox("Use backlinks as personalization", value=True)
     low_pr_q = st.slider("Low PR threshold (quantile)", 0.05, 0.5, 0.20, 0.05)
     high_ch_q = st.slider("High CheiRank threshold (top quantile)", 0.05, 0.5, 0.10, 0.05)
 
 st.caption("Upload CSV or Excel exports. Columns are auto-detected.")
+
 c1, c2, c3, c4 = st.columns(4)
-with c1: pages_file = st.file_uploader("PAGES export (Screaming Frog HTML)", type=["csv","xlsx","xls"], key="pages")
-with c2: inlinks_file = st.file_uploader("INLINKS export (All Inlinks)", type=["csv","xlsx","xls"], key="inlinks")
-with c3: backlinks_file = st.file_uploader("BACKLINKS export (Ahrefs, optional)", type=["csv","xlsx","xls"], key="backlinks")
-with c4: gsc_file = st.file_uploader("GSC export (optional, for semantics)", type=["csv","xlsx","xls"], key="gsc")
+with c1:
+    pages_file = st.file_uploader("PAGES export (Screaming Frog HTML)", type=["csv","xlsx","xls"], key="pages")
+with c2:
+    inlinks_file = st.file_uploader("INLINKS export (All Inlinks)", type=["csv","xlsx","xls"], key="inlinks")
+with c3:
+    backlinks_file = st.file_uploader("BACKLINKS export (Ahrefs, optional)", type=["csv","xlsx","xls"], key="backlinks")
+with c4:
+    gsc_file = st.file_uploader("GSC export (optional, for semantics)", type=["csv","xlsx","xls"], key="gsc")
 
 if pages_file and inlinks_file:
     try:
@@ -405,8 +425,10 @@ if pages_file and inlinks_file:
         df_backlinks = read_table(backlinks_file) if backlinks_file else pd.DataFrame()
         df_gsc = read_gsc(gsc_file) if gsc_file else pd.DataFrame()
 
-        G, df_pages = build_internal_graph(df_pages, df_inlinks, keep_query, link_scope=link_scope, root_domains=root_domains)
+        # Build graph
+        G, df_pages = build_internal_graph(df_pages, df_inlinks, keep_query, link_scope=link_scope)
 
+        # Backlink personalization
         backlink_counts = aggregate_backlinks(df_backlinks, keep_query) if use_backlinks else pd.Series(dtype=float)
         personalization = None
         if use_backlinks and len(backlink_counts) > 0:
@@ -417,7 +439,10 @@ if pages_file and inlinks_file:
         pr = compute_pagerank(G, alpha=alpha, personalization=personalization)
         ch = compute_cheirank(G, alpha=alpha)
 
-        indeg = dict(G.in_degree()); outdeg = dict(G.out_degree())
+        # Degrees
+        indeg = dict(G.in_degree())
+        outdeg = dict(G.out_degree())
+
         nodes = list(G.nodes())
         df = pd.DataFrame({
             'url': nodes,
@@ -427,21 +452,17 @@ if pages_file and inlinks_file:
             'cheirank': [ch.get(n, 0.0) for n in nodes],
             'backlinks_refcnt': [float(backlink_counts.get(n, 0.0)) if len(backlink_counts) else 0.0 for n in nodes],
         })
+
+        # Normalize for readability
         df['pagerank_norm'] = df['pagerank'] / (df['pagerank'].sum() if df['pagerank'].sum() > 0 else 1.0)
         df['cheirank_norm'] = df['cheirank'] / (df['cheirank'].sum() if df['cheirank'].sum() > 0 else 1.0)
-
-        # Build semantics and categories
-        gsc_sem = pd.Series(dtype=str)
-        if not df_gsc.empty: gsc_sem = build_gsc_semantics(df_gsc, keep_query=keep_query)
-        page_texts = build_page_texts(df_pages, gsc_sem)
-        category_map = assign_categories(df_pages, categories, page_texts)
-        df['category'] = df['url'].map(lambda u: category_map.get(u, ""))
 
         df = flag_pages(df, 'pagerank', 'cheirank', 'backlinks_refcnt', low_pr_q=low_pr_q, high_ch_q=high_ch_q)
 
         st.success("Analysis complete.")
 
         tabs = st.tabs(["Overview","Low PR candidates","Orphans","Backlinks but low PR","Link hubs (high CheiRank)","All pages","Menu/Footer links (debug)","Suggestions"])
+
         with tabs[0]:
             st.subheader("Top pages by PageRank")
             st.dataframe(df.sort_values('pagerank', ascending=False).head(25), use_container_width=True)
@@ -485,10 +506,9 @@ if pages_file and inlinks_file:
             st.subheader("Internal link suggestions")
             if gsc_file is None:
                 st.info("Upload a GSC export to improve semantic matching. We'll still use titles/H1s if present.")
-            sugg_df = suggest_internal_links(df, page_texts, category_map,
-                                             prefer_same_category=prefer_same_category,
-                                             same_category_only=same_category_only,
-                                             low_pr_q=low_pr_q)
+            gsc_sem = build_gsc_semantics(df_gsc, keep_query=keep_query) if not df_gsc.empty else pd.Series(dtype=str)
+            page_texts = build_page_texts(df_pages, gsc_sem)
+            sugg_df = suggest_internal_links(df, page_texts, low_pr_q=low_pr_q)
             if sugg_df.empty:
                 st.info("No targets met the criteria for suggestions.")
             else:
@@ -496,10 +516,31 @@ if pages_file and inlinks_file:
                 csv2 = sugg_df.to_csv(index=False).encode('utf-8')
                 st.download_button("Download suggestions CSV", data=csv2, file_name="internal_link_suggestions.csv", mime="text/csv")
 
+        # Downloads
         st.markdown("---")
         st.subheader("Download results")
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("Download metrics CSV", data=csv, file_name="seo_rank_results.csv", mime="text/csv")
+
+        # Quick recommendations (more verbose)
+        st.markdown("---")
+        st.subheader("Quick recommendations")
+        orphan_cnt = int((df['inlinks'] == 0).sum())
+        low_pr_thresh = df['pagerank'].quantile(low_pr_q)
+        low_pr_cnt = int((df['pagerank'] <= low_pr_thresh).sum())
+        with_backlinks_low_pr = int(((df['backlinks_refcnt'] > 0) & (df['pagerank'] <= low_pr_thresh)).sum())
+        hubs_cnt = int((df['cheirank'] >= df['cheirank'].quantile(1 - high_ch_q)).sum())
+        rec = pd.DataFrame({
+            "Item": ["Orphans","Low internal PR","Backlinked but low PR","Link hubs"],
+            "Count": [orphan_cnt, low_pr_cnt, with_backlinks_low_pr, hubs_cnt],
+            "Action": [
+                "Add contextual links from relevant categories/hubs",
+                f"Promote with internal links from high PR/semantically related pages (<= {low_pr_q:.0%} quantile)",
+                "Add internal links from topically related hubs and evergreen guides",
+                "Audit outlinks; consolidate or prioritize contextual anchors"
+            ]
+        })
+        st.dataframe(rec, use_container_width=True)
 
     except Exception as e:
         st.error(f"Error: {e}")
