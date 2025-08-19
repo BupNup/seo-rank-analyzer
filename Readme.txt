@@ -45,10 +45,6 @@ score =
 0.15 * Ahrefs_norm(source)
 [+ cap_weight * capacity(source) if Link Budget is enabled]
 
-markdown
-Copy
-Edit
-
 - **semantic_similarity** — TF-IDF by default; **Embeddings** if selected and available.  
 - **PR_norm / CH_norm** — normalized PageRank and CheiRank (columns sum to 1).  
 - **Ahrefs_norm** — external support for the **source** page from the Ahrefs export (grouped links or unique ref entities).  
