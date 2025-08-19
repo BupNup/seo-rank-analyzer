@@ -442,7 +442,8 @@ st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
 st.title("SEO PageRank & CheiRank Analyzer")
 
 st.markdown("""
-By: Andre Neves https://www.linkedin.com/in/andreneves/ <br>
+By: Andre Neves https://www.linkedin.com/in/andreneves/
+
 **What this tool does**
 - Ingests **4 exports** (Screaming Frog Pages + All Inlinks, Ahrefs Backlinks, GSC).
 - Builds an **internal-only link graph** using your homepage to filter out external links and excludes homepage as a source.
