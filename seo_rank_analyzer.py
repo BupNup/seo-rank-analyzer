@@ -175,7 +175,6 @@ def aggregate_backlinks(backlinks: pd.DataFrame, keep_query: bool, use_quality: 
     if use_quality:
         dr = _pick(df, AHREFS_DR_CANDS)  # 0-100
         ur = _pick(df, AHREFS_UR_CANDS)  # 0-100
-        # sqrt scaling to avoid whales dominating; if only one present, use it
         dr_w = np.sqrt(np.clip(dr.fillna(0.0), 0, 100)/100.0) if dr is not None else None
         ur_w = np.sqrt(np.clip(ur.fillna(0.0), 0, 100)/100.0) if ur is not None else None
         if dr_w is not None and ur_w is not None:
@@ -200,7 +199,7 @@ def aggregate_backlinks(backlinks: pd.DataFrame, keep_query: bool, use_quality: 
         if ref_col: df["ref_key"] = df[ref_col].map(lambda x: normalize_url(x, keep_query))
         else:       df["ref_key"] = np.arange(len(df)).astype(str)  # fallback unique
 
-    # Collapse multiple rows from same ref_key -> take max weight (domain once), then sum per target
+    # Collapse by ref_key -> max per key, then sum per target
     agg = (df.dropna(subset=["target","ref_key"])
              .query("target != '' and ref_key != ''")
              .groupby(["target","ref_key"], as_index=False)["row_weight"].max())
@@ -344,7 +343,7 @@ def explode_suggestions(sugg_df: pd.DataFrame) -> pd.DataFrame:
 
 def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], category_map: Dict[str,str],
                            prefer_same_category: bool, same_category_only: bool,
-                           homepage_url: str,
+                           homepage_url: str, exclude_homepage_source: bool = True,
                            backlink_weight: float=0.15, pr_weight: float=0.35,
                            ch_weight: float=0.15, sem_weight: float=0.35,
                            use_link_budget: bool=False, cap_weight: float=0.20,
@@ -382,7 +381,8 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
         score = (sem_weight*sims + pr_weight*pr_norm + ch_weight*ch_norm + backlink_weight*bl_norm + (cap_weight*cap if use_link_budget else 0))
         allow = np.ones(len(urls), dtype=bool); allow[i]=False
-        if homepage_norm in urls: allow[urls.index(homepage_norm)] = False
+        if exclude_homepage_source and homepage_norm in urls:
+            allow[urls.index(homepage_norm)] = False
 
         t_cat = category_map.get(t.url,"")
         if same_category_only and t_cat:
@@ -407,83 +407,25 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v10)")
+st.title("SEO PageRank & CheiRank Analyzer (v11)")
 
-# Concise explainer (doesn't push uploaders down)
+# Concise explainer including the new homepage toggle
 st.markdown("""
-### What this tool does
-- Reads **4 exports**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **Google Search Console** (GSC).
-- Builds an **internal link graph** for your site only (homepage sets the domain scope; homepage is **not** used as a source).
-- Calculates **PageRank** (page importance) and **CheiRank** (hub/outlink strength).
-- Understands page topics from **GSC queries** + **Title / Meta / H1 / H2** (TF-IDF by default; Embeddings optional).
-- Assigns pages to your **categories** via TF-IDF similarity.
-- Surfaces **internal linking suggestions** for pages that are **low PR** or **orphans**.
-
----
-
-### How suggestions are ranked (weights)
-`Score = 35% Semantic similarity + 35% PageRank + 15% CheiRank + 15% Ahrefs [+ Link budget if enabled]`
-
-- **Prefer same-category sources:** **+15% boost** to sources in the same category as the target (a nudge, not a filter).
-- **Restrict to same category:** hard filter (only same-category sources allowed).
-- **Link budget (optional):** adds capacity `PR / (outlinks + 1)` so high-PR pages with fewer outlinks get extra weight.
-- **Ahrefs DR/UR weighting (optional):** multiplies the Ahrefs signal by the referring **Domain Rating (DR)** and **URL Rating (UR)** for better quality.
-
----
-
-### Which links count for PR
-- **contextual (default):** use main-content links only.
-- **all:** include header/footer/nav links.
-- **menu_footer:** header/footer/nav only (debug/sensitivity check).
-
----
-
-### Uploads required
-1) Screaming Frog **Pages (HTML)**  
-2) Screaming Frog **All Inlinks**  
-3) **Ahrefs Backlinks**  
-4) **GSC** query export  
-+ **Full homepage URL** (to keep links internal and exclude homepage as a source)
-
----
-
-### Glossary (columns & terms)
-**General metrics**
-- **inlinks** — number of internal links pointing **to** the page.
-- **outlinks** — number of internal links going **out** from the page.
-- **pagerank (PR)** — internal importance score from the site’s link graph.
-- **cheirank (CH)** — hub score; pages that link out a lot to useful pages rank higher.
-- **pagerank_norm / cheirank_norm** — PR/CH normalized so the column sums to 1 (comparable across pages).
-- **backlinks_refcnt** — external support for the page from Ahrefs (grouped links or unique ref entities; optionally weighted by DR/UR).
-- **category / category_score** — assigned category and its semantic confidence (higher = better match).
-- **flags** — quick labels like *Orphan*, *Low internal PR*, *Has backlinks, needs internal links*, *Link hub*.
-
-**Suggestions (compact view)**
-- **target** — page that needs links.
-- **reason** — why it’s targeted (e.g., *Orphan*, *Low PR*).
-- **anchor_hint** — common keywords from the target to inspire natural anchors.
-- **suggestions** — packed list of the top source URLs with their metrics (see detailed view).
-
-**Suggestions (detailed view)**
-- **source_rank** — position of the candidate source for this target (1 = best).
-- **source_url** — page to link **from**.
-- **score** — the combined ranking score using the weights above (+15% same-category boost if enabled).
-- **PR** — source page’s normalized PageRank.
-- **CH** — source page’s normalized CheiRank (hubness).
-- **sim** — **semantic similarity** between source and target (0–1).  
-- **cap** — **link budget capacity**: normalized `PR / (outlinks + 1)` (0 if link-budget option is off).
-- **source_category** — category assigned to the source page.
-
-*Notes:*  
-- The **homepage** is never suggested as a source.  
-- Pages with **zero outlinks** get a small penalty in ranking (still shown).  
-- If Embeddings aren’t available, the tool automatically uses **TF-IDF** for similarity.
+**How this works (quick)**
+- **Graph:** internal links only using your homepage for domain scope.
+- **Scores:** PageRank (importance) and CheiRank (hubness).
+- **Semantics:** TF-IDF by default from GSC queries + Title/Meta/H1/H2. Embeddings optional.
+- **Suggestions score:** 35% sim + 35% PR + 15% CH + 15% Ahrefs [+ Link budget if enabled].
+- **Category options:** Prefer same-category (+15% boost) or restrict to same category only.
+- **Homepage in suggestions:** controlled by the new checkbox. Exclude is on by default.
+- **Ahrefs DR/UR weighting:** optional quality weighting for the Ahrefs signal.
 """)
 
 with st.sidebar:
     st.header("Settings")
-    homepage_input = st.text_input("Full homepage URL", value="", placeholder="https://www.example.com/", help="Used to: (1) keep ONLY internal links; (2) exclude homepage from suggestions.")
+    homepage_input = st.text_input("Full homepage URL", value="", placeholder="https://www.example.com/", help="Sets domain scope so links are internal.")
     home_root = canonical_home_root(homepage_input)
+    exclude_home_src = st.checkbox("Exclude homepage as a source", value=True)
 
     cats_text = st.text_area("Main categories (one per line or comma-separated)", value="")
     categories  = [c.strip() for c in re.split(r"[\n,]+", cats_text) if c.strip()]
@@ -498,7 +440,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Semantics engine")
-    # Default = TF-IDF
     sem_choice  = st.radio("Choose engine", ["TF-IDF (fast)","Embeddings (better, needs model)"], index=0)
     if sem_choice.startswith("Embeddings") and not _EMBED_READY:
         st.warning("Embeddings packages not available; falling back to TF-IDF unless installed (pip install sentence-transformers).")
@@ -510,7 +451,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Ahrefs quality weighting")
-    use_quality = st.checkbox("Weight Ahrefs by DR/UR (quality)", value=False, help="Uses DR/UR from Ahrefs export to weight referring sources. Affects PR personalization and the 'Ahrefs' term in suggestion scoring.")
+    use_quality = st.checkbox("Weight Ahrefs by DR/UR (quality)", value=False, help="Uses DR/UR from Ahrefs export to weight referring sources. Affects PR personalization and the Ahrefs term in suggestion scoring.")
 
 st.caption("Upload CSV or Excel exports. All **four** files are required.")
 c1,c2,c3,c4 = st.columns(4)
@@ -610,6 +551,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 prefer_same_category=prefer_same,
                 same_category_only=same_only,
                 homepage_url=homepage_input,
+                exclude_homepage_source=exclude_home_src,
                 low_pr_q=low_pr_q,
                 top_k_sources=5,
                 use_link_budget=use_cap,
