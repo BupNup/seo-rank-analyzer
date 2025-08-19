@@ -5,3 +5,4 @@ networkx
 chardet
 python-dateutil
 scipy
+scikit-learn
