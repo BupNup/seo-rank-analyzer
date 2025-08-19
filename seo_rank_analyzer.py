@@ -407,7 +407,7 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("PageRank & CheiRank Analyzer for Internal Links")
+st.title("TIPR: PageRank & CheiRank Analyzer for Internal Links")
 
 # Concise explainer including the new homepage toggle
 st.markdown("""
