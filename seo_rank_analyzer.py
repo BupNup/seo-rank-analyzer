@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import io
 import re
@@ -12,6 +11,15 @@ import networkx as nx
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+# Optional: embeddings
+_EMBED_READY = False
+try:
+    from sentence_transformers import SentenceTransformer
+    import torch
+    _EMBED_READY = True
+except Exception:
+    _EMBED_READY = False
 
 DEFAULT_PAGERANK_ALPHA = 0.85
 
@@ -292,19 +300,58 @@ def assign_categories_semantic(df_pages: pd.DataFrame, categories: List[str]) ->
     scores  = {urls[i]: float(best_scores[i]) for i in range(len(urls))}
     return mapping, scores
 
-def tfidf_similarity(texts: Dict[str,str], urls: List[str]):
+def tfidf_matrix(texts: Dict[str,str], urls: List[str]):
     corpus = [texts.get(u, '') for u in urls]
-    vec = TfidfVectorizer(stop_words='english', min_df=1, max_features=50000)
-    X = vec.fit_transform(corpus)
+    vec = TfidfVectorizer(stop_words='english', min_df=1, max_features=80000)
+    X = vec.fit_transform(corpus)  # [n_pages, n_terms]
     index = {u:i for i,u in enumerate(urls)}
-    return vec, X, index
+    return ("tfidf", vec, X, index)
+
+@st.cache_resource(show_spinner=False)
+def load_embedder(model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    if not _EMBED_READY:
+        return None
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SentenceTransformer(model_name, device=device)
+        return model
+    except Exception:
+        return None
+
+def embed_matrix(model, texts: Dict[str,str], urls: List[str]):
+    if model is None:
+        return None
+    corpus = [texts.get(u, '') for u in urls]
+    embs = model.encode(corpus, normalize_embeddings=True, show_progress_bar=False)
+    index = {u:i for i,u in enumerate(urls)}
+    return ("emb", None, embs, index)
+
+def semantic_backend(mode: str, texts: Dict[str,str], urls: List[str]):
+    if mode == "Embeddings":
+        model = load_embedder()
+        em = embed_matrix(model, texts, urls)
+        if em is not None:
+            return em
+        st.warning("Embeddings model unavailable; falling back to TF-IDF.")
+    return tfidf_matrix(texts, urls)
+
+def semantic_sim_vector(kind, obj, mat, i_idx: int):
+    if kind == "emb":
+        sims = (mat[i_idx] @ mat.T).astype(np.float64)
+        sims = np.clip(sims, -1.0, 1.0)
+        return sims
+    vec_i = mat[i_idx]
+    sims = cosine_similarity(vec_i, mat).ravel()
+    return sims
 
 def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], category_map: Dict[str,str],
                            prefer_same_category: bool, same_category_only: bool,
                            homepage_url: str,
                            backlink_weight: float = 0.15, pr_weight: float = 0.35,
                            ch_weight: float = 0.15, sem_weight: float = 0.35,
-                           low_pr_q: float = 0.20, top_k_sources: int = 5) -> pd.DataFrame:
+                           use_link_budget: bool = True, cap_weight: float = 0.20,
+                           low_pr_q: float = 0.20, top_k_sources: int = 5,
+                           semantic_mode: str = "TF-IDF") -> pd.DataFrame:
     df = df_metrics.copy()
     low_pr_thresh = df['pagerank'].quantile(low_pr_q)
     df['reason'] = ''
@@ -322,12 +369,19 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
     homepage_norm = normalize_url(homepage_url, keep_query=False)
 
-    _, X, idx = tfidf_similarity(texts, urls)
+    kind, obj, MAT, idx = semantic_backend("Embeddings" if semantic_mode.startswith("Emb") else "TF-IDF", texts, urls)
+
     pr_norm = (df.set_index('url')['pagerank_norm']).reindex(urls).fillna(0.0).to_numpy()
     ch_norm = (df.set_index('url')['cheirank_norm']).reindex(urls).fillna(0.0).to_numpy()
     bln = (df.set_index('url')['backlinks_refcnt']).reindex(urls).fillna(0.0)
     bl_norm = (bln / (bln.max() if bln.max() > 0 else 1.0)).to_numpy()
     out_deg = df.set_index('url')['outlinks'].reindex(urls).fillna(0).to_numpy()
+
+    if use_link_budget:
+        cap = pr_norm / (out_deg + 1.0)
+        cap = cap / (cap.max() if cap.max() > 0 else 1.0)
+    else:
+        cap = np.zeros_like(pr_norm)
 
     rows = []
     from collections import Counter
@@ -335,13 +389,17 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
     for t in targets.itertuples(index=False):
         t_url = t.url
         if t_url not in idx: continue
-        t_vec = X[idx[t_url]]
-        sims = cosine_similarity(t_vec, X).ravel()
+        i = idx[t_url]
+        sims = semantic_sim_vector(kind, obj, MAT, i)
 
-        score = sem_weight * sims + pr_weight * pr_norm + ch_weight * ch_norm + backlink_weight * bl_norm
+        score = (sem_weight * sims
+                 + pr_weight * pr_norm
+                 + ch_weight * ch_norm
+                 + backlink_weight * bl_norm
+                 + (cap_weight * cap if use_link_budget else 0))
 
         allow = np.array([True]*len(urls))
-        allow[idx[t_url]] = False
+        allow[i] = False
         if homepage_norm in urls:
             allow[urls.index(homepage_norm)] = False
 
@@ -352,11 +410,12 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
             same_mask = np.array([category_map.get(u, "") == t_cat for u in urls])
             score = np.where(same_mask, score * 1.15, score)
 
+        # Soft penalty for zero outlinks
         score = np.where(out_deg > 0, score, score * 0.5)
         score = np.where(allow, score, -1.0)
 
         top_idx = score.argsort()[::-1][:top_k_sources]
-        cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
+        cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cap={cap[j]:.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
 
         tokens = [w for w in re.findall(r"[a-z0-9\-]+", texts.get(t_url, "")) if len(w) > 2]
         common = [w for w,_ in Counter(tokens).most_common(8)]
@@ -393,7 +452,7 @@ def flag_pages(df: pd.DataFrame, pr_col: str, ch_col: str, backlink_col: str, lo
     return df
 
 def parse_suggestion_line(line: str) -> Dict[str, object]:
-    out = {"source_url": line.strip(), "score": np.nan, "PR": np.nan, "CH": np.nan, "sim": np.nan, "source_category": ""}
+    out = {"source_url": line.strip(), "score": np.nan, "PR": np.nan, "CH": np.nan, "sim": np.nan, "cap": np.nan, "source_category": ""}
     if not line or '|' not in line:
         return out
     parts = [p.strip() for p in line.split('|')]
@@ -405,20 +464,13 @@ def parse_suggestion_line(line: str) -> Dict[str, object]:
             k, v = tok.split('=', 1)
             k = k.strip().lower()
             v = v.strip()
-            if k == 'score':
-                try: out['score'] = float(v)
-                except: pass
-            elif k == 'pr':
-                try: out['PR'] = float(v)
-                except: pass
-            elif k == 'ch':
-                try: out['CH'] = float(v)
-                except: pass
-            elif k == 'sim':
-                try: out['sim'] = float(v)
-                except: pass
-            elif k == 'cat':
-                out['source_category'] = v
+            try_val = lambda x: float(x) if re.match(r'^-?\d+(\.\d+)?(e-?\d+)?$', x, flags=re.I) else np.nan
+            if k == 'score': out['score'] = try_val(v)
+            elif k == 'pr': out['PR'] = try_val(v)
+            elif k == 'ch': out['CH'] = try_val(v)
+            elif k == 'sim': out['sim'] = try_val(v)
+            elif k == 'cap': out['cap'] = try_val(v)
+            elif k == 'cat': out['source_category'] = v
     return out
 
 def explode_suggestions(sugg_df: pd.DataFrame) -> pd.DataFrame:
@@ -439,17 +491,16 @@ def explode_suggestions(sugg_df: pd.DataFrame) -> pd.DataFrame:
 
 # UI
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer")
+st.title("SEO PageRank & CheiRank Analyzer (v9)")
 
 st.markdown("""
 **What this tool does**
 - Ingests **4 exports** (Screaming Frog Pages + All Inlinks, Ahrefs Backlinks, GSC).
-- Builds an **internal-only link graph** using your homepage to filter out external links and excludes homepage as a source.
-- Computes **PageRank** (importance) and **CheiRank** (outlinking hubs).
-- Uses **Ahrefs** as PageRank personalization (weighted by *Links in group* or unique referring entities).
+- Builds an **internal-only link graph** using your homepage to filter out external links and excludes homepage from suggestions.
+- Computes **PageRank** (importance) and **CheiRank** (outlinking hubs), with Ahrefs as personalization.
 - Derives **semantics** from GSC queries + Title/H1/H2/Meta Description.
-- Assigns **categories** to pages using TF‑IDF similarity of **URL path + Title + Description** vs your category list (we also expose a per-page **category_score**).
-- Generates **multi-URL internal linking suggestions** per low-PR/orphan page, ranked by **semantic similarity + PR + CheiRank + backlinks**.
+- Assigns **categories** using TF-IDF page text vs your category list.
+- Generates **multi-URL internal linking suggestions**, ranked by **semantic similarity + PR + CheiRank + backlinks + (optional) link budget**.
 """)
 
 with st.sidebar:
@@ -467,6 +518,17 @@ with st.sidebar:
     alpha = st.slider("PageRank damping (alpha)", 0.50, 0.99, DEFAULT_PAGERANK_ALPHA, 0.01)
     low_pr_q = st.slider("Low PR threshold (quantile)", 0.05, 0.5, 0.20, 0.05)
     high_ch_q = st.slider("High CheiRank threshold (top quantile)", 0.05, 0.5, 0.10, 0.05)
+
+    st.markdown("---")
+    st.subheader("Semantics engine")
+    sem_choice = st.radio("Choose engine", options=["TF-IDF (fast)", "Embeddings (better, needs model)"], index=0, help="Embeddings use sentence-transformers/all-MiniLM-L6-v2 if available.")
+    if sem_choice.startswith("Embeddings") and not _EMBED_READY:
+        st.warning("Embeddings packages not available; falling back to TF-IDF unless installed (pip install sentence-transformers).")
+
+    st.markdown("---")
+    st.subheader("Link budget (optional)")
+    use_cap = st.checkbox("Include link budget (PR_norm / (outlinks+1)) in source score", value=True)
+    cap_w = st.slider("Link budget weight", 0.0, 0.5, 0.20, 0.01)
 
 st.caption("Upload CSV or Excel exports. All four files are **required**.")
 c1, c2, c3, c4 = st.columns(4)
@@ -565,7 +627,10 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                                              same_category_only=same_category_only,
                                              homepage_url=homepage_input,
                                              low_pr_q=low_pr_q,
-                                             top_k_sources=5)
+                                             top_k_sources=5,
+                                             use_link_budget=use_cap,
+                                             cap_weight=cap_w,
+                                             semantic_mode=sem_choice)
             if sugg_df.empty:
                 st.info("No targets met the criteria for suggestions.")
             else:
