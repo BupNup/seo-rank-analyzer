@@ -420,8 +420,8 @@ st.markdown("""
 - Assigns **categories** to pages from your category list.
 
 **How suggestions are ranked:**
-Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
-Optional: **Link budget** adds `PR / (outlinks + 1)`.
+- Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
+- Optional: **Link budget** adds `PR / (outlinks + 1)`.
 
 **Outputs:**
 - Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
