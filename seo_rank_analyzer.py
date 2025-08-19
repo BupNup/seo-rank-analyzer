@@ -443,6 +443,7 @@ st.title("SEO PageRank & CheiRank Analyzer")
 
 st.markdown("""
 **What this tool does**
+By: Andre Neves https://www.linkedin.com/in/andreneves/
 - Ingests **4 exports** (Screaming Frog Pages + All Inlinks, Ahrefs Backlinks, GSC).
 - Builds an **internal-only link graph** using your homepage to filter out external links and excludes homepage as a source.
 - Computes **PageRank** (importance) and **CheiRank** (outlinking hubs).
