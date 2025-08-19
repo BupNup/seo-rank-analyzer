@@ -412,18 +412,18 @@ st.title("SEO PageRank & CheiRank Analyzer (v11)")
 # Concise explainer including the new homepage toggle
 st.markdown("""
 
-**What this tool does**
+**What this tool does:**
 - Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
 - Builds an **internal link graph** (homepage sets domain scope;).
 - Calculates **PageRank** (importance) and **CheiRank** (hubness).
 - Understands topics from **GSC queries + Title + Meta + H1 + H2**. Default **TF-IDF**; **Embeddings** optional.
 - Assigns **categories** to pages from your category list.
 
-### How suggestions are ranked
+**How suggestions are ranked:**
 Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
 Optional: **Link budget** adds `PR / (outlinks + 1)`.
 
-### Outputs
+**Outputs:**
 - Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
 - **Suggestions** per weak page: best source URLs (score, PR, CH, sim, capacity, category, anchor hint).
 
