@@ -25,9 +25,10 @@ Find low PageRank or orphan pages, then identify the best internal pages to link
   2) Screaming Frog **All Inlinks**  
   3) **Ahrefs Backlinks**  
   4) **Google Search Console** (GSC) query export  
-- Builds an **internal-only link graph**. Your **homepage URL** defines the domain scope. External links are removed.
+- Builds an **internal-only link graph**. Your **homepage URL** defines the domain scope; external links are removed.
+- **Homepage as a source is configurable:** a checkbox (enabled by default) **excludes the homepage from link suggestions**. Untick it to allow the homepage to appear as a suggested source. *(This does not change the graph itself, only the suggestion filter.)*
 - Computes **PageRank** (page importance) and **CheiRank** (hubness). CheiRank = PageRank on the reversed graph.
-- Understands topics from **GSC queries + Title + Meta Description + H1 + H2**. Default similarity engine is **TF-IDF**. **Embeddings** are optional.
+- Understands topics from **GSC queries + Title + Meta Description + H1 + H2**. Default similarity engine is **TF-IDF**; **Embeddings** are optional.
 - Assigns **categories** to each URL by comparing its text (URL path + Title + Description) to your category list.
 - Generates **internal linking suggestions** for weak pages: **low PR**, **orphans**, or **“has backlinks but low PR.”**
 
@@ -38,8 +39,7 @@ Find low PageRank or orphan pages, then identify the best internal pages to link
 ### Suggestion score
 For each weak **target** page, candidate **sources** are ranked by:
 
-score =
-0.35 * semantic_similarity(target, source)
+score = 0.35 * semantic_similarity(target, source)
 0.35 * PR_norm(source)
 0.15 * CH_norm(source)
 0.15 * Ahrefs_norm(source)
@@ -50,11 +50,11 @@ score =
 - **Ahrefs_norm** — external support for the **source** page from the Ahrefs export (grouped links or unique ref entities).  
 - **capacity** — normalized `PR_norm / (outlinks + 1)`; rewards sources with authority **and** fewer outlinks.
 
-Extra rules:
+**Extra rules**
 - **Prefer same-category sources** — **×1.15** multiplier on the score (nudge, not a filter).
 - **Restrict to same category only** — hard filter; only same-category sources are eligible.
-- Pages with **zero outlinks** get a small penalty.  
-- The **homepage** is never suggested as a source.
+- **Homepage source toggle** — when **Exclude homepage as a source** is checked (default), the homepage will **not** be suggested; untick to allow it.  
+- Pages with **zero outlinks** get a small penalty.
 
 ### PageRank personalization
 Ahrefs strength is used to **personalize PageRank**, so URLs with more external support receive slightly more probability mass during PR computation.
@@ -93,6 +93,7 @@ The app auto-detects common column names. Typical fields:
   - **contextual** (default) — PR built from in-content links.
   - **all** — include header/footer/navigation.
   - **menu_footer** — only non-content links (debug / sensitivity checks).
+- **Exclude homepage as a source** — **on by default**; when on, the homepage is never suggested as a source. Turn **off** to allow homepage suggestions. *(Graph scope is still defined by the homepage URL either way.)*
 - **Keep URL query parameters** — off by default. Turn on only if parameters represent indexable content.
 - **Link Budget** — off by default. When on, adds `PR_norm / (outlinks + 1)` as a capacity term to the suggestion score (weight configurable).
 - **Ahrefs DR/UR weighting** — off by default. When on, the Ahrefs signal is weighted by DR/UR and flows into PR personalization and the 15% Ahrefs term.
