@@ -274,12 +274,12 @@ def build_page_texts_for_category(df_pages: pd.DataFrame) -> Dict[str, str]:
         out[u] = " ".join(parts).lower()
     return out
 
-def assign_categories_semantic(df_pages: pd.DataFrame, categories: List[str]) -> Dict[str, str]:
-    if not categories: return {}
+def assign_categories_semantic(df_pages: pd.DataFrame, categories: List[str]) -> Tuple[Dict[str,str], Dict[str,float]]:
+    if not categories: return {}, {}
     pages_text = build_page_texts_for_category(df_pages)
     urls = list(pages_text.keys())
     cat_labels = [c.strip() for c in categories if c.strip()]
-    if not urls or not cat_labels: return {u: "" for u in urls}
+    if not urls or not cat_labels: return {u: "" for u in urls}, {u: 0.0 for u in urls}
     corpus = list(pages_text.values()) + cat_labels
     vec = TfidfVectorizer(stop_words='english', ngram_range=(1,2), max_features=50000)
     X = vec.fit_transform(corpus)
@@ -288,11 +288,9 @@ def assign_categories_semantic(df_pages: pd.DataFrame, categories: List[str]) ->
     sims = cosine_similarity(X_pages, X_cats)
     best_idx = sims.argmax(axis=1)
     best_scores = sims[np.arange(len(urls)), best_idx]
-    THRESH = 0.08
-    mapping = {}
-    for i, u in enumerate(urls):
-        mapping[u] = cat_labels[best_idx[i]] if best_scores[i] >= THRESH else ""
-    return mapping
+    mapping = {urls[i]: cat_labels[best_idx[i]] for i in range(len(urls))}
+    scores  = {urls[i]: float(best_scores[i]) for i in range(len(urls))}
+    return mapping, scores
 
 def tfidf_similarity(texts: Dict[str,str], urls: List[str]):
     corpus = [texts.get(u, '') for u in urls]
@@ -373,7 +371,7 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
             'backlinks': t.backlinks_refcnt,
             'inlinks': t.inlinks,
             'anchor_hint': anchor,
-            'suggestions': "\\n".join(cands)
+            'suggestions': "\n".join(cands)
         })
 
     return pd.DataFrame(rows)
@@ -394,43 +392,54 @@ def flag_pages(df: pd.DataFrame, pr_col: str, ch_col: str, backlink_col: str, lo
     df['flags'] = flags
     return df
 
+def parse_suggestion_line(line: str) -> Dict[str, object]:
+    out = {"source_url": line.strip(), "score": np.nan, "PR": np.nan, "CH": np.nan, "sim": np.nan, "source_category": ""}
+    if not line or '|' not in line:
+        return out
+    parts = [p.strip() for p in line.split('|')]
+    if not parts:
+        return out
+    out["source_url"] = parts[0]
+    for tok in parts[1:]:
+        if '=' in tok:
+            k, v = tok.split('=', 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if k == 'score':
+                try: out['score'] = float(v)
+                except: pass
+            elif k == 'pr':
+                try: out['PR'] = float(v)
+                except: pass
+            elif k == 'ch':
+                try: out['CH'] = float(v)
+                except: pass
+            elif k == 'sim':
+                try: out['sim'] = float(v)
+                except: pass
+            elif k == 'cat':
+                out['source_category'] = v
+    return out
+
 def explode_suggestions(sugg_df: pd.DataFrame) -> pd.DataFrame:
-    """Turn the compact suggestions into a long, readable table (one source per row)."""
     rows = []
-    pat = re.compile(r"\\s*([^|]+?)\\s*\\|\\s*score=([0-9.\\-eE]+)\\s*\\|\\s*PR=([0-9.\\-eE]+)\\s*\\|\\s*CH=([0-9.\\-eE]+)\\s*\\|\\s*sim=([0-9.\\-eE]+)\\s*\\|\\s*cat=(.*)\\s*")
     for r in sugg_df.itertuples(index=False):
-        lines = str(getattr(r, 'suggestions', '')).split('\\n')
+        lines = str(getattr(r, 'suggestions', '')).split('\n')
         for rank, line in enumerate(lines, start=1):
-            m = pat.match(line.strip())
-            if not m:
-                if line.strip():
-                    rows.append({
-                        "target": r.target,
-                        "target_category": r.category,
-                        "reason": r.reason,
-                        "anchor_hint": r.anchor_hint,
-                        "source_rank": rank,
-                        "source_url": line.strip(),
-                        "score": np.nan, "PR": np.nan, "CH": np.nan, "sim": np.nan,
-                        "source_category": ""
-                    })
-                continue
-            url, score, pr, ch, sim, cat = m.groups()
+            parsed = parse_suggestion_line(line)
             rows.append({
                 "target": r.target,
                 "target_category": r.category,
                 "reason": r.reason,
                 "anchor_hint": r.anchor_hint,
                 "source_rank": rank,
-                "source_url": url.strip(),
-                "score": float(score), "PR": float(pr), "CH": float(ch), "sim": float(sim),
-                "source_category": cat.strip()
+                **parsed
             })
     return pd.DataFrame(rows)
 
 # UI
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v7)")
+st.title("SEO PageRank & CheiRank Analyzer (v8)")
 
 st.markdown("""
 **What this tool does**
@@ -439,25 +448,17 @@ st.markdown("""
 - Computes **PageRank** (importance) and **CheiRank** (outlinking hubs).
 - Uses **Ahrefs** as PageRank personalization (weighted by *Links in group* or unique referring entities).
 - Derives **semantics** from GSC queries + Title/H1/H2/Meta Description.
-- Assigns **categories** to pages using TF‑IDF similarity of **URL path + Title + Description** vs your category list.
+- Assigns **categories** to pages using TF‑IDF similarity of **URL path + Title + Description** vs your category list (we also expose a per-page **category_score**).
 - Generates **multi-URL internal linking suggestions** per low-PR/orphan page, ranked by **semantic similarity + PR + CheiRank + backlinks**.
 """)
 
 with st.sidebar:
     st.header("Settings")
     homepage_input = st.text_input("Full homepage URL", value="", placeholder="https://www.example.com/", help="Used to: (1) keep ONLY internal links; (2) exclude homepage from suggestions.")
-    def _home_root(u):
-        try:
-            host = urlparse(u).netloc.lower()
-            if host.startswith("www."):
-                host = host[4:]
-            return host
-        except Exception:
-            return ""
-    home_root = _home_root(homepage_input)
+    home_root = canonical_home_root(homepage_input)
 
     categories_s = st.text_area("Main categories (one per line or comma-separated)", value="")
-    categories = [c.strip() for c in re.split(r"[\\n,]+", categories_s) if c.strip()]
+    categories = [c.strip() for c in re.split(r"[\n,]+", categories_s) if c.strip()]
     prefer_same_category = st.checkbox("Prefer same-category sources", value=True)
     same_category_only = st.checkbox("Restrict to same category only", value=False)
 
@@ -508,8 +509,9 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
 
         gsc_sem = build_gsc_semantics(df_gsc, keep_query=keep_query)
         page_texts = build_page_texts(df_pages, gsc_sem)
-        category_map = assign_categories_semantic(df_pages, categories) if categories else {u: "" for u in df['url']}
+        category_map, category_scores = assign_categories_semantic(df_pages, categories) if categories else ({u: "" for u in df['url']}, {u: 0.0 for u in df['url']})
         df['category'] = df['url'].map(lambda u: category_map.get(u, ""))
+        df['category_score'] = df['url'].map(lambda u: float(category_scores.get(u, 0.0)))
 
         df = flag_pages(df, 'pagerank', 'cheirank', 'backlinks_refcnt', low_pr_q=low_pr_q, high_ch_q=high_ch_q)
 
@@ -571,7 +573,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 st.dataframe(sugg_df, use_container_width=True)
                 csv_compact = sugg_df.to_csv(index=False).encode('utf-8')
                 st.download_button("Download compact CSV", data=csv_compact, file_name="internal_link_suggestions_compact.csv", mime="text/csv")
-                # Expanded long table
+
                 st.markdown("**Detailed view (one source per row)**")
                 long_df = explode_suggestions(sugg_df)
                 st.dataframe(long_df, use_container_width=True, height=min(900, 80 + 28*len(long_df)))
