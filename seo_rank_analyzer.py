@@ -412,7 +412,7 @@ st.title("SEO PageRank & CheiRank Analyzer (v11)")
 # Concise explainer including the new homepage toggle
 st.markdown("""
 
-### What this tool does
+**What this tool does**
 - Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
 - Builds an **internal link graph** (homepage sets domain scope;).
 - Calculates **PageRank** (importance) and **CheiRank** (hubness).
