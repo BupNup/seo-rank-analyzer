@@ -411,16 +411,31 @@ st.title("SEO PageRank & CheiRank Analyzer (v11)")
 
 # Concise explainer including the new homepage toggle
 st.markdown("""
-**How this works (quick)**
-- **Graph:** internal links only using your homepage for domain scope.
-- **Scores:** PageRank (importance) and CheiRank (hubness).
-- **Semantics:** TF-IDF by default from GSC queries + Title/Meta/H1/H2. Embeddings optional.
-- **Suggestions score:** 35% sim + 35% PR + 15% CH + 15% Ahrefs [+ Link budget if enabled].
-- **Category options:** Prefer same-category (+15% boost) or restrict to same category only.
-- **Homepage in suggestions:** Exclude is on by default.
-- **Ahrefs DR/UR weighting:** optional quality weighting for the Ahrefs signal.
 
-➡️ **Need more details?** Read the full guide: **[Readme.txt](https://github.com/BupNup/seo-rank-analyzer/blob/main/Readme.txt)** 
+### What this tool does
+- Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
+- Builds an **internal link graph** (homepage sets domain scope; homepage is **not** used as a source).
+- Calculates **PageRank** (importance) and **CheiRank** (hubness).
+- Understands topics from **GSC queries + Title + Meta + H1 + H2**. Default **TF-IDF**; **Embeddings** optional.
+- Assigns **categories** to pages from your category list.
+
+### How suggestions are ranked
+Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
+Optional: **Link budget** adds `PR / (outlinks + 1)`.
+
+### Key options
+- **Homepage in suggestions:** Exclude is on by default.
+- **Prefer same-category sources**: +15% boost (not a filter), default option.
+- **Restrict to same category**: hard filter.
+- **Which links count for PR**: **contextual** (default) | **all** | **menu/footer**.
+- **Ahrefs DR/UR weighting**: when on, weights Ahrefs by quality of the referring domain/page.
+
+### Outputs
+- Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
+- **Suggestions** per weak page: best source URLs (score, PR, CH, sim, capacity, category, anchor hint).
+
+➡️ **Need more details?** Read the full guide: **[Readme.txt](https://github.com/BupNup/seo-rank-analyzer/blob/main/Readme.txt)**
+
 """)
 
 with st.sidebar:
