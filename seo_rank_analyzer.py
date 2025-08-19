@@ -439,7 +439,7 @@ def explode_suggestions(sugg_df: pd.DataFrame) -> pd.DataFrame:
 
 # UI
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v8)")
+st.title("SEO PageRank & CheiRank Analyzer")
 
 st.markdown("""
 **What this tool does**
