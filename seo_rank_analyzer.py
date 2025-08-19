@@ -419,6 +419,8 @@ st.markdown("""
 - **Category options:** Prefer same-category (+15% boost) or restrict to same category only.
 - **Homepage in suggestions:** Exclude is on by default.
 - **Ahrefs DR/UR weighting:** optional quality weighting for the Ahrefs signal.
+
+➡️ **Need more details?** Read the full guide: **[Readme.txt](https://github.com/BupNup/seo-rank-analyzer/blob/main/Readme.txt)** 
 """)
 
 with st.sidebar:
