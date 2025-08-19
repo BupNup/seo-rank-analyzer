@@ -411,15 +411,73 @@ st.title("SEO PageRank & CheiRank Analyzer (v10)")
 
 # Concise explainer (doesn't push uploaders down)
 st.markdown("""
-**How this works (quick):**
-- **Graph:** built from internal links only (based on your homepage). *Homepage is excluded as a source.*
-- **Scores:** PageRank (importance) + CheiRank (hubness).  
-- **Semantics:** TF-IDF (default) from GSC queries + Title/Meta/H1/H2. *(Embeddings optional)*
-- **Suggestions score:** `35% sim + 35% PR + 15% CH + 15% Ahrefs` [+ **link budget** if enabled].  
-- **Prefer same-category:** +15% boost to same-category sources (not a filter).
-- **Restrict to same category:** hard filter — only same-category sources.
-- **Link budget:** adds capacity = `PR / (outlinks+1)` to the score.
-- **Ahrefs DR/UR weighting:** when ON, DR/UR of the **referring source** weights Ahrefs strength (better quality signal).
+### What this tool does
+- Reads **4 exports**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **Google Search Console** (GSC).
+- Builds an **internal link graph** for your site only (homepage sets the domain scope; homepage is **not** used as a source).
+- Calculates **PageRank** (page importance) and **CheiRank** (hub/outlink strength).
+- Understands page topics from **GSC queries** + **Title / Meta / H1 / H2** (TF-IDF by default; Embeddings optional).
+- Assigns pages to your **categories** via TF-IDF similarity.
+- Surfaces **internal linking suggestions** for pages that are **low PR** or **orphans**.
+
+---
+
+### How suggestions are ranked (weights)
+`Score = 35% Semantic similarity + 35% PageRank + 15% CheiRank + 15% Ahrefs [+ Link budget if enabled]`
+
+- **Prefer same-category sources:** **+15% boost** to sources in the same category as the target (a nudge, not a filter).
+- **Restrict to same category:** hard filter (only same-category sources allowed).
+- **Link budget (optional):** adds capacity `PR / (outlinks + 1)` so high-PR pages with fewer outlinks get extra weight.
+- **Ahrefs DR/UR weighting (optional):** multiplies the Ahrefs signal by the referring **Domain Rating (DR)** and **URL Rating (UR)** for better quality.
+
+---
+
+### Which links count for PR
+- **contextual (default):** use main-content links only.
+- **all:** include header/footer/nav links.
+- **menu_footer:** header/footer/nav only (debug/sensitivity check).
+
+---
+
+### Uploads required
+1) Screaming Frog **Pages (HTML)**  
+2) Screaming Frog **All Inlinks**  
+3) **Ahrefs Backlinks**  
+4) **GSC** query export  
++ **Full homepage URL** (to keep links internal and exclude homepage as a source)
+
+---
+
+### Glossary (columns & terms)
+**General metrics**
+- **inlinks** — number of internal links pointing **to** the page.
+- **outlinks** — number of internal links going **out** from the page.
+- **pagerank (PR)** — internal importance score from the site’s link graph.
+- **cheirank (CH)** — hub score; pages that link out a lot to useful pages rank higher.
+- **pagerank_norm / cheirank_norm** — PR/CH normalized so the column sums to 1 (comparable across pages).
+- **backlinks_refcnt** — external support for the page from Ahrefs (grouped links or unique ref entities; optionally weighted by DR/UR).
+- **category / category_score** — assigned category and its semantic confidence (higher = better match).
+- **flags** — quick labels like *Orphan*, *Low internal PR*, *Has backlinks, needs internal links*, *Link hub*.
+
+**Suggestions (compact view)**
+- **target** — page that needs links.
+- **reason** — why it’s targeted (e.g., *Orphan*, *Low PR*).
+- **anchor_hint** — common keywords from the target to inspire natural anchors.
+- **suggestions** — packed list of the top source URLs with their metrics (see detailed view).
+
+**Suggestions (detailed view)**
+- **source_rank** — position of the candidate source for this target (1 = best).
+- **source_url** — page to link **from**.
+- **score** — the combined ranking score using the weights above (+15% same-category boost if enabled).
+- **PR** — source page’s normalized PageRank.
+- **CH** — source page’s normalized CheiRank (hubness).
+- **sim** — **semantic similarity** between source and target (0–1).  
+- **cap** — **link budget capacity**: normalized `PR / (outlinks + 1)` (0 if link-budget option is off).
+- **source_category** — category assigned to the source page.
+
+*Notes:*  
+- The **homepage** is never suggested as a source.  
+- Pages with **zero outlinks** get a small penalty in ranking (still shown).  
+- If Embeddings aren’t available, the tool automatically uses **TF-IDF** for similarity.
 """)
 
 with st.sidebar:
