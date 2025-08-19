@@ -394,9 +394,43 @@ def flag_pages(df: pd.DataFrame, pr_col: str, ch_col: str, backlink_col: str, lo
     df['flags'] = flags
     return df
 
+def explode_suggestions(sugg_df: pd.DataFrame) -> pd.DataFrame:
+    """Turn the compact suggestions into a long, readable table (one source per row)."""
+    rows = []
+    pat = re.compile(r"\\s*([^|]+?)\\s*\\|\\s*score=([0-9.\\-eE]+)\\s*\\|\\s*PR=([0-9.\\-eE]+)\\s*\\|\\s*CH=([0-9.\\-eE]+)\\s*\\|\\s*sim=([0-9.\\-eE]+)\\s*\\|\\s*cat=(.*)\\s*")
+    for r in sugg_df.itertuples(index=False):
+        lines = str(getattr(r, 'suggestions', '')).split('\\n')
+        for rank, line in enumerate(lines, start=1):
+            m = pat.match(line.strip())
+            if not m:
+                if line.strip():
+                    rows.append({
+                        "target": r.target,
+                        "target_category": r.category,
+                        "reason": r.reason,
+                        "anchor_hint": r.anchor_hint,
+                        "source_rank": rank,
+                        "source_url": line.strip(),
+                        "score": np.nan, "PR": np.nan, "CH": np.nan, "sim": np.nan,
+                        "source_category": ""
+                    })
+                continue
+            url, score, pr, ch, sim, cat = m.groups()
+            rows.append({
+                "target": r.target,
+                "target_category": r.category,
+                "reason": r.reason,
+                "anchor_hint": r.anchor_hint,
+                "source_rank": rank,
+                "source_url": url.strip(),
+                "score": float(score), "PR": float(pr), "CH": float(ch), "sim": float(sim),
+                "source_category": cat.strip()
+            })
+    return pd.DataFrame(rows)
+
 # UI
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v6)")
+st.title("SEO PageRank & CheiRank Analyzer (v7)")
 
 st.markdown("""
 **What this tool does**
@@ -412,7 +446,15 @@ st.markdown("""
 with st.sidebar:
     st.header("Settings")
     homepage_input = st.text_input("Full homepage URL", value="", placeholder="https://www.example.com/", help="Used to: (1) keep ONLY internal links; (2) exclude homepage from suggestions.")
-    home_root = canonical_home_root(homepage_input)
+    def _home_root(u):
+        try:
+            host = urlparse(u).netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+            return host
+        except Exception:
+            return ""
+    home_root = _home_root(homepage_input)
 
     categories_s = st.text_area("Main categories (one per line or comma-separated)", value="")
     categories = [c.strip() for c in re.split(r"[\\n,]+", categories_s) if c.strip()]
@@ -515,7 +557,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 st.info("No link position/path columns found in Inlinks to classify.")
 
         with tabs[7]:
-            st.subheader("Internal link suggestions (homepage excluded; multiple sources per target)")
+            st.subheader("Internal link suggestions")
             sugg_df = suggest_internal_links(df, page_texts, category_map,
                                              prefer_same_category=prefer_same_category,
                                              same_category_only=same_category_only,
@@ -525,26 +567,16 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             if sugg_df.empty:
                 st.info("No targets met the criteria for suggestions.")
             else:
-                colcfg = {
-                    "suggestions": st.column_config.TextAreaColumn(
-                        "Suggested sources (ranked)",
-                        help="Top candidates (URL | composite score | PR | CheiRank | semantic sim | category).",
-                        width="large"
-                    ),
-                    "anchor_hint": st.column_config.TextColumn("Anchor hint", width="medium"),
-                    "reason": st.column_config.TextColumn("Reason", width="medium"),
-                    "category": st.column_config.TextColumn("Category", width="small")
-                }
-                st.data_editor(
-                    sugg_df,
-                    column_config=colcfg,
-                    hide_index=True,
-                    disabled=True,
-                    use_container_width=True,
-                    height=min(900, 80 + 32*len(sugg_df))
-                )
-                csv2 = sugg_df.to_csv(index=False).encode('utf-8')
-                st.download_button("Download suggestions CSV", data=csv2, file_name="internal_link_suggestions.csv", mime="text/csv")
+                st.markdown("**Compact view (one row per target)**")
+                st.dataframe(sugg_df, use_container_width=True)
+                csv_compact = sugg_df.to_csv(index=False).encode('utf-8')
+                st.download_button("Download compact CSV", data=csv_compact, file_name="internal_link_suggestions_compact.csv", mime="text/csv")
+                # Expanded long table
+                st.markdown("**Detailed view (one source per row)**")
+                long_df = explode_suggestions(sugg_df)
+                st.dataframe(long_df, use_container_width=True, height=min(900, 80 + 28*len(long_df)))
+                csv_long = long_df.to_csv(index=False).encode('utf-8')
+                st.download_button("Download detailed CSV", data=csv_long, file_name="internal_link_suggestions_detailed.csv", mime="text/csv")
 
         st.markdown("---")
         st.subheader("Download results")
