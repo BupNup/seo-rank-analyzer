@@ -414,7 +414,7 @@ st.markdown("""
 
 ### What this tool does
 - Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
-- Builds an **internal link graph** (homepage sets domain scope; homepage is **not** used as a source).
+- Builds an **internal link graph** (homepage sets domain scope;).
 - Calculates **PageRank** (importance) and **CheiRank** (hubness).
 - Understands topics from **GSC queries + Title + Meta + H1 + H2**. Default **TF-IDF**; **Embeddings** optional.
 - Assigns **categories** to pages from your category list.
@@ -422,13 +422,6 @@ st.markdown("""
 ### How suggestions are ranked
 Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
 Optional: **Link budget** adds `PR / (outlinks + 1)`.
-
-### Key options
-- **Homepage in suggestions:** Exclude is on by default.
-- **Prefer same-category sources**: +15% boost (not a filter), default option.
-- **Restrict to same category**: hard filter.
-- **Which links count for PR**: **contextual** (default) | **all** | **menu/footer**.
-- **Ahrefs DR/UR weighting**: when on, weights Ahrefs by quality of the referring domain/page.
 
 ### Outputs
 - Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
