@@ -417,7 +417,7 @@ st.markdown("""
 - **Semantics:** TF-IDF by default from GSC queries + Title/Meta/H1/H2. Embeddings optional.
 - **Suggestions score:** 35% sim + 35% PR + 15% CH + 15% Ahrefs [+ Link budget if enabled].
 - **Category options:** Prefer same-category (+15% boost) or restrict to same category only.
-- **Homepage in suggestions:** controlled by the new checkbox. Exclude is on by default.
+- **Homepage in suggestions:** Exclude is on by default.
 - **Ahrefs DR/UR weighting:** optional quality weighting for the Ahrefs signal.
 """)
 
