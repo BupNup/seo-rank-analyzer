@@ -455,15 +455,24 @@ st.title("SEO PageRank & CheiRank Analyzer")
 
 # Short explainer with 200-only note
 st.markdown("""
-**How this works (quick)**
-- **200-only analysis:** only pages with HTTP **Status Code = 200** are included in PR/CH and suggestions.
-- **Graph:** internal links only using your homepage for domain scope.
-- **Scores:** PageRank (importance) and CheiRank (hubness).
-- **Semantics:** TF-IDF by default from GSC queries + Title/Meta/H1/H2. Embeddings optional.
-- **Suggestions score:** 35% sim + 35% PR + 15% CH + 15% Ahrefs [+ Link budget if enabled].
-- **Category options:** Prefer same-category (+15% boost) or restrict to same category only.
-- **Homepage in suggestions:** controlled by the checkbox (exclude is on by default).
-- **Ahrefs DR/UR weighting:** optional quality weighting for the Ahrefs signal.
+
+**What this tool does:**
+- Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
+- Builds an **internal link graph** (homepage sets domain scope;).
+- Calculates **PageRank** (importance) and **CheiRank** (hubness).
+- Understands topics from **GSC queries + Title + Meta + H1 + H2**. Default **TF-IDF**; **Embeddings** optional.
+- Assigns **categories** to pages from your category list.
+
+**How suggestions are ranked:**
+- Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
+- Optional: **Link budget** adds `PR / (outlinks + 1)`.
+
+**Outputs:**
+- Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
+- **Suggestions** per weak page: best source URLs (score, PR, CH, sim, capacity, category, anchor hint).
+
+➡️ **Need more details?** Read the full guide: **[Readme.txt](https://github.com/BupNup/seo-rank-analyzer/blob/main/Readme.txt)**
+
 """)
 
 with st.sidebar:
