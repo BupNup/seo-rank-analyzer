@@ -451,7 +451,7 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v12)")
+st.title("SEO PageRank & CheiRank Analyzer")
 
 # Short explainer with 200-only note
 st.markdown("""
