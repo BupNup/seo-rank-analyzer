@@ -35,6 +35,9 @@ PAGE_TITLE_CANDS = ["Title 1","Title","Meta Title"]
 PAGE_DESC_CANDS  = ["Meta Description 1","Meta Description"]
 PAGE_H1_CANDS    = ["H1-1","H1"]
 
+# NEW: Status code candidates (Screaming Frog Pages export)
+STATUS_CODE_CANDS = ["Status Code","Status code","Status","HTTP Status","StatusCode","Response Codes"]
+
 # ---------- Helpers ----------
 @st.cache_data(show_spinner=False)
 def sniff_encoding(file_bytes: bytes) -> str:
@@ -118,20 +121,53 @@ def filter_inlinks_by_scope(inlinks: pd.DataFrame, scope:str) -> pd.DataFrame:
     if scope == "menu_footer":  return tmp[tmp["_cls"] == "menu_footer"].drop(columns=["_cls"])
     return inlinks
 
-# ---------- Graph build ----------
-def build_internal_graph(pages: pd.DataFrame, inlinks: pd.DataFrame, keep_query: bool, link_scope:str, home_root:str) -> Tuple[nx.DiGraph, pd.DataFrame]:
+# ---------- Graph build (now filtering to HTTP 200 pages) ----------
+def build_internal_graph(
+    pages: pd.DataFrame,
+    inlinks: pd.DataFrame,
+    keep_query: bool,
+    link_scope: str,
+    home_root: str
+) -> Tuple[nx.DiGraph, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      G: directed graph built ONLY from pages with HTTP 200 status
+      pages_200: filtered Pages df (status_code == 200)
+      pages_non200: excluded Pages df (status_code != 200), for transparency
+    """
     url_col = pick_column(pages, URL_COL_CANDIDATES_PAGES)
-    if not url_col: raise ValueError("Pages file needs a URL column like 'Address' or 'URL'.")
+    if not url_col:
+        raise ValueError("Pages file needs a URL column like 'Address' or 'URL'.")
+
     pages = pages.copy()
     pages["url_norm"] = pages[url_col].map(lambda x: normalize_url(x, keep_query))
     pages["host"]     = pages["url_norm"].map(get_host)
-    if home_root: pages = pages[pages["host"].map(lambda h: is_internal_host(h, home_root))]
-    nodes_series = pages["url_norm"].dropna().drop_duplicates()
-    nodes_series = nodes_series[nodes_series != ""]
 
+    # Limit to domain scope first
+    if home_root:
+        pages = pages[pages["host"].map(lambda h: is_internal_host(h, home_root))]
+
+    # Filter to HTTP 200 (if we can find a status column)
+    status_col = pick_column(pages, STATUS_CODE_CANDS)
+    if status_col:
+        pages["status_code"] = pd.to_numeric(pages[status_col], errors="coerce")
+        pages_200    = pages[(pages["status_code"] == 200) & (pages["url_norm"] != "")]
+        pages_non200 = pages[(pages["status_code"] != 200) & (pages["url_norm"] != "")]
+    else:
+        # No status column found: proceed with all (but note this later)
+        pages["status_code"] = np.nan
+        pages_200    = pages[pages["url_norm"] != ""]
+        pages_non200 = pages.iloc[0:0]
+
+    nodes_series = pages_200["url_norm"].dropna().drop_duplicates()
+    nodes_series = nodes_series[nodes_series != ""]
+    valid_nodes  = set(nodes_series.tolist())
+
+    # Prepare inlinks
     src_col = pick_column(inlinks, INLINKS_SRC_CANDIDATES)
     dst_col = pick_column(inlinks, INLINKS_DST_CANDIDATES)
-    if not src_col or not dst_col: raise ValueError("Inlinks file needs columns like 'Source' and 'Destination'.")
+    if not src_col or not dst_col:
+        raise ValueError("Inlinks file needs columns like 'Source' and 'Destination'.")
 
     inlinks = inlinks.copy()
     inlinks["src"] = inlinks[src_col].map(lambda x: normalize_url(x, keep_query))
@@ -139,20 +175,28 @@ def build_internal_graph(pages: pd.DataFrame, inlinks: pd.DataFrame, keep_query:
     inlinks["src_host"] = inlinks["src"].map(get_host)
     inlinks["dst_host"] = inlinks["dst"].map(get_host)
 
+    # Apply menu/footer vs contextual filter
     inlinks = filter_inlinks_by_scope(inlinks, link_scope)
-    if home_root:
-        inlinks = inlinks[inlinks["src_host"].map(lambda h: is_internal_host(h, home_root)) & inlinks["dst_host"].map(lambda h: is_internal_host(h, home_root))]
 
-    valid_nodes = set(nodes_series.tolist())
+    # Enforce domain scope on edges
+    if home_root:
+        inlinks = inlinks[
+            inlinks["src_host"].map(lambda h: is_internal_host(h, home_root)) &
+            inlinks["dst_host"].map(lambda h: is_internal_host(h, home_root))
+        ]
+
+    # Keep only edges where BOTH endpoints are HTTP 200 pages
     edges = inlinks[["src","dst"]].dropna()
     edges = edges[(edges["src"]!="") & (edges["dst"]!="")]
     edges = edges[edges["dst"].isin(valid_nodes) & edges["src"].isin(valid_nodes)]
     edges["weight"] = 1.0
     edges = edges.groupby(["src","dst"], as_index=False)["weight"].sum()
 
+    # Build graph
     G = nx.DiGraph(); G.add_nodes_from(valid_nodes)
-    for r in edges.itertuples(index=False): G.add_edge(r.src, r.dst, weight=float(r.weight))
-    return G, pages
+    for r in edges.itertuples(index=False):
+        G.add_edge(r.src, r.dst, weight=float(r.weight))
+    return G, pages_200, pages_non200
 
 # ---------- Ahrefs aggregation (with optional DR/UR weighting) ----------
 def _pick(df, cands): 
@@ -407,28 +451,19 @@ def suggest_internal_links(df_metrics: pd.DataFrame, texts: Dict[str,str], categ
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("TIPR: PageRank & CheiRank Analyzer for Internal Links")
+st.title("SEO PageRank & CheiRank Analyzer (v12)")
 
-# Concise explainer including the new homepage toggle
+# Short explainer with 200-only note
 st.markdown("""
-
-**What this tool does:**
-- Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
-- Builds an **internal link graph** (homepage sets domain scope;).
-- Calculates **PageRank** (importance) and **CheiRank** (hubness).
-- Understands topics from **GSC queries + Title + Meta + H1 + H2**. Default **TF-IDF**; **Embeddings** optional.
-- Assigns **categories** to pages from your category list.
-
-**How suggestions are ranked:**
-- Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
-- Optional: **Link budget** adds `PR / (outlinks + 1)`.
-
-**Outputs:**
-- Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
-- **Suggestions** per weak page: best source URLs (score, PR, CH, sim, capacity, category, anchor hint).
-
-➡️ **Need more details?** Read the full guide: **[Readme.txt](https://github.com/BupNup/seo-rank-analyzer/blob/main/Readme.txt)**
-
+**How this works (quick)**
+- **200-only analysis:** only pages with HTTP **Status Code = 200** are included in PR/CH and suggestions.
+- **Graph:** internal links only using your homepage for domain scope.
+- **Scores:** PageRank (importance) and CheiRank (hubness).
+- **Semantics:** TF-IDF by default from GSC queries + Title/Meta/H1/H2. Embeddings optional.
+- **Suggestions score:** 35% sim + 35% PR + 15% CH + 15% Ahrefs [+ Link budget if enabled].
+- **Category options:** Prefer same-category (+15% boost) or restrict to same category only.
+- **Homepage in suggestions:** controlled by the checkbox (exclude is on by default).
+- **Ahrefs DR/UR weighting:** optional quality weighting for the Ahrefs signal.
 """)
 
 with st.sidebar:
@@ -475,12 +510,17 @@ if not homepage_input:
 
 if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_input:
     try:
-        df_pages = read_table(pages_file)
-        df_in    = read_table(inlinks_file)
-        df_bl    = read_table(backlinks_file)
-        df_gsc   = read_gsc(gsc_file)
+        df_pages_raw = read_table(pages_file)
+        df_in        = read_table(inlinks_file)
+        df_bl        = read_table(backlinks_file)
+        df_gsc       = read_gsc(gsc_file)
 
-        G, df_pages = build_internal_graph(df_pages, df_in, keep_query, link_scope, home_root)
+        G, df_pages, df_pages_non200 = build_internal_graph(
+            df_pages_raw, df_in, keep_query, link_scope, home_root
+        )
+
+        if df_pages_non200.shape[0] > 0:
+            st.info(f"Excluded {df_pages_non200.shape[0]} non-200 pages from analysis.")
 
         bl_strength = aggregate_backlinks(df_bl, keep_query, use_quality=use_quality)
         p_vec = bl_strength[bl_strength.index.isin(G.nodes())]
@@ -502,18 +542,21 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
         df["pagerank_norm"] = df["pagerank"] / (df["pagerank"].sum() if df["pagerank"].sum()>0 else 1.0)
         df["cheirank_norm"] = df["cheirank"] / (df["cheirank"].sum() if df["cheirank"].sum()>0 else 1.0)
 
-        # Semantics + categories
-        gsc_sem = build_gsc_semantics(df_gsc, keep_query=keep_query)
-        page_texts = build_page_texts(df_pages, gsc_sem)
+        # Semantics + categories on 200 pages only
+        gsc_sem   = build_gsc_semantics(df_gsc, keep_query=keep_query)
+        page_texts= build_page_texts(df_pages, gsc_sem)
         cat_map, cat_scores = assign_categories_semantic(df_pages, categories) if categories else ({u:"" for u in df["url"]},{u:0.0 for u in df["url"]})
         df["category"] = df["url"].map(lambda u: cat_map.get(u,"")); df["category_score"] = df["url"].map(lambda u: float(cat_scores.get(u,0.0)))
 
         # Flags
         df = flag_pages(df, low_pr_q=low_pr_q, high_ch_q=high_ch_q)
 
-        st.success("Analysis complete.")
+        st.success("Analysis complete (HTTP 200 pages only).")
 
-        tabs = st.tabs(["Overview","Low PR candidates","Orphans","Backlinks but low PR","Link hubs (high CheiRank)","All pages","Menu/Footer links (debug)","Suggestions"])
+        tabs = st.tabs([
+            "Overview","Low PR candidates","Orphans","Backlinks but low PR",
+            "Link hubs (high CheiRank)","All pages (200 only)","Excluded non-200 pages","Menu/Footer links (debug)","Suggestions"
+        ])
 
         with tabs[0]:
             st.subheader("Top pages by PageRank")
@@ -527,7 +570,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             st.dataframe(df[df["pagerank"]<=th].sort_values("pagerank"), use_container_width=True)
 
         with tabs[2]:
-            st.caption("Pages with zero internal inlinks")
+            st.caption("Pages with zero internal inlinks (200 only)")
             st.dataframe(df[df["inlinks"]==0].sort_values("pagerank", ascending=False), use_container_width=True)
 
         with tabs[3]:
@@ -545,6 +588,14 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             st.dataframe(df.sort_values("pagerank", ascending=False), use_container_width=True)
 
         with tabs[6]:
+            if df_pages_non200.shape[0] == 0:
+                st.info("No non-200 pages detected in the Pages export.")
+            else:
+                show_cols = [c for c in ["url_norm","status_code","Title","Meta Description","H1-1","Address","URL"] if c in df_pages_non200.columns]
+                st.caption("These URLs were excluded from analysis because their Status Code != 200.")
+                st.dataframe(df_pages_non200[show_cols].sort_values("status_code"), use_container_width=True)
+
+        with tabs[7]:
             st.caption("Header/footer/nav rows (for transparency)")
             pos_col, path_col, elem_col, anch_col = detect_link_position_columns(df_in)
             if pos_col or path_col or elem_col or anch_col:
@@ -554,7 +605,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             else:
                 st.info("No link position/path columns found in Inlinks to classify.")
 
-        with tabs[7]:
+        with tabs[8]:
             st.subheader("Internal link suggestions")
             sugg_df = suggest_internal_links(
                 df, page_texts, cat_map,
