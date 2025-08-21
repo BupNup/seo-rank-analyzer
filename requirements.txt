@@ -6,4 +6,5 @@ chardet
 python-dateutil
 scipy
 scikit-learn
+openpyxl
 sentence-transformers
