@@ -201,8 +201,8 @@ def aggregate_backlinks(backlinks: pd.DataFrame, keep_query: bool, use_quality: 
     if use_quality:
         dr = _pick_numeric(df, AHREFS_DR_CANDS)  # 0–100
         ur = _pick_numeric(df, AHREFS_UR_CANDS)  # 0–100
-        dr_w = np.sqrt(np.clip((dr or 0).fillna(0.0), 0, 100)/100.0) if dr is not None else None
-        ur_w = np.sqrt(np.clip((ur or 0).fillna(0.0), 0, 100)/100.0) if ur is not None else None
+dr_w = np.sqrt(np.clip(dr.fillna(0.0), 0, 100)/100.0) if dr is not None else None
+ur_w = np.sqrt(np.clip(ur.fillna(0.0), 0, 100)/100.0) if ur is not None else None
         if dr_w is not None and ur_w is not None:
             qual = (dr_w * ur_w).replace(0, 1e-6)
         elif dr_w is not None:
