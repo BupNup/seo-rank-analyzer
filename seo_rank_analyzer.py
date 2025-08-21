@@ -578,8 +578,13 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             st.info(f"Excluded {df_pages_non200.shape[0]} non-200 pages from analysis.")
 
         bl_strength = aggregate_backlinks(df_bl, keep_query, use_quality=use_quality)
-        p_vec = bl_strength[bl_strength.index.isin(G.nodes())]
-        personalization = (p_vec / p_vec.sum()).to_dict() if p_vec.sum() > 0 else None
+# Ahrefs → personalization (must include ALL nodes; zeros allowed)
+bl_strength = aggregate_backlinks(df_bl, keep_query, use_quality=use_quality)
+
+pers = {n: float(bl_strength.get(n, 0.0)) for n in G.nodes()}
+s = sum(pers.values())
+personalization = None if s == 0 else {n: v / s for n, v in pers.items()}
+
 
         pr = compute_pagerank(G, alpha=alpha, personalization=personalization)
         ch = compute_cheirank(G, alpha=alpha)
