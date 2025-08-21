@@ -1,7 +1,8 @@
 from __future__ import annotations
 import io, re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse
+from collections import defaultdict
 
 import chardet, numpy as np, pandas as pd, networkx as nx, streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -34,7 +35,7 @@ GSC_IMPR_CANDS = ["Impressions","Impr","Impressions Total"]
 
 PAGE_TITLE_CANDS = ["Title 1","Title","Meta Title"]
 PAGE_H1_CANDS    = ["H1-1","H1"]
-PAGE_DESC_CANDS  = ["Meta Description 1","Meta Description","Description"]
+PAGE_DESC_CANDS  = ["Meta Description 1","Meta Description","Meta description","Description"]
 
 STATUS_CODE_CANDS = ["Status Code","Status code","Status","HTTP Status","StatusCode","Response Codes"]
 
@@ -46,14 +47,24 @@ def sniff_encoding(file_bytes: bytes) -> str:
 @st.cache_data(show_spinner=False)
 def read_table(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read(); enc = sniff_encoding(raw); buf = io.BytesIO(raw)
-    try: return pd.read_csv(buf, sep=None, engine="python", encoding=enc)
-    except Exception: buf.seek(0); return pd.read_excel(buf)
+    try:
+        return pd.read_csv(buf, sep=None, engine="python", encoding=enc)
+    except Exception:
+        buf.seek(0)
+        try:
+            return pd.read_excel(buf)
+        except Exception:
+            buf.seek(0)
+            return pd.read_csv(buf, encoding="utf-8", engine="python")
 
 @st.cache_data(show_spinner=False)
 def read_gsc(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read(); enc = sniff_encoding(raw); buf = io.BytesIO(raw)
-    try: return pd.read_csv(buf, encoding=enc)
-    except Exception: buf.seek(0); return pd.read_excel(buf)
+    try:
+        return pd.read_csv(buf, encoding=enc)
+    except Exception:
+        buf.seek(0)
+        return pd.read_excel(buf)
 
 def _strip_fragment(u:str) -> str: return u.split("#",1)[0]
 def _strip_query(u:str, keep:bool) -> str: return u if keep else u.split("?",1)[0]
@@ -185,7 +196,7 @@ def build_internal_graph(
     return G, pages_200, pages_non200
 
 # ---------- Ahrefs aggregation (optional DR/UR quality) ----------
-def _pick_numeric(df, cands): 
+def _pick_numeric(df, cands):
     col = pick_column(df, cands)
     return pd.to_numeric(df[col], errors="coerce") if col else None
 
@@ -244,7 +255,7 @@ def compute_pagerank(G: nx.DiGraph, alpha: float, personalization: Optional[Dict
 def compute_cheirank(G: nx.DiGraph, alpha: float) -> Dict[str,float]:
     return compute_pagerank(G.reverse(copy=True), alpha=alpha, personalization=None)
 
-# ---------- Semantics (GSC + slug + Title + H1 + Description + H2) ----------
+# ---------- Semantics (GSC + slug + Title + Desc + H1 + H2) ----------
 def build_gsc_semantics(gsc: pd.DataFrame, keep_query: bool) -> pd.Series:
     if gsc is None or gsc.empty: return pd.Series(dtype=str)
     pg_col = pick_column(gsc, GSC_PAGE_CANDS); q_col = pick_column(gsc, GSC_QUERY_CANDS); i_col = pick_column(gsc, GSC_IMPR_CANDS)
@@ -267,7 +278,7 @@ def _collect_h2_text(row: pd.Series) -> str:
     return " ".join(texts)
 
 def build_component_texts(df_pages: pd.DataFrame, gsc_sem: pd.Series) -> Dict[str, Dict[str,str]]:
-    """Return per-url component texts: slug, title, h1, desc, h2, gsc (lowercased)."""
+    """Return per-url component texts: slug, title, desc, h1, h2, gsc (lowercased)."""
     url_col = pick_column(df_pages, URL_COL_CANDIDATES_PAGES)
     t_col   = pick_column(df_pages, PAGE_TITLE_CANDS)
     h1_col  = pick_column(df_pages, PAGE_H1_CANDS)
@@ -279,11 +290,11 @@ def build_component_texts(df_pages: pd.DataFrame, gsc_sem: pd.Series) -> Dict[st
         path = urlparse(u).path
         slug = path.replace("/", " ").replace("-", " ").strip().lower()
         title = (str(r.get(t_col,"")) if t_col else "").lower()
-        h1    = (str(r.get(h1_col,"")) if h1_col else "").lower()
         desc  = (str(r.get(d_col,"")) if d_col else "").lower()
+        h1    = (str(r.get(h1_col,"")) if h1_col else "").lower()
         h2    = _collect_h2_text(r).lower()
         gsc   = (str(gsc_sem.get(u,"")) if isinstance(gsc_sem, pd.Series) else "").lower()
-        out[u] = {"slug":slug, "title":title, "h1":h1, "desc":desc, "h2":h2, "gsc":gsc}
+        out[u] = {"slug":slug, "title":title, "desc":desc, "h1":h1, "h2":h2, "gsc":gsc}
     return out
 
 @st.cache_resource(show_spinner=False)
@@ -304,19 +315,19 @@ def _weights_ok(*ws: float):
 def semantic_backend_weighted(
     components: Dict[str, Dict[str,str]],
     urls: List[str],
-    slug_w: float, title_w: float, h1_w: float, gsc_w: float, desc_w: float, h2_w: float,
+    slug_w: float, title_w: float, desc_w: float, h1_w: float, h2_w: float, gsc_w: float,
     mode: str = "TF-IDF"
 ):
     """Return (kind, obj, matrix, index_map) where matrix is page vectors."""
-    slug_w, title_w, h1_w, gsc_w, desc_w, h2_w = _weights_ok(slug_w, title_w, h1_w, gsc_w, desc_w, h2_w)
+    slug_w, title_w, desc_w, h1_w, h2_w, gsc_w = _weights_ok(slug_w, title_w, desc_w, h1_w, h2_w, gsc_w)
 
     # Build component corpora aligned by urls
     slug_c = [components.get(u,{}).get("slug","")  for u in urls]
     titl_c = [components.get(u,{}).get("title","") for u in urls]
-    h1_c   = [components.get(u,{}).get("h1","")    for u in urls]
-    gsc_c  = [components.get(u,{}).get("gsc","")   for u in urls]
     desc_c = [components.get(u,{}).get("desc","")  for u in urls]
+    h1_c   = [components.get(u,{}).get("h1","")    for u in urls]
     h2_c   = [components.get(u,{}).get("h2","")    for u in urls]
+    gsc_c  = [components.get(u,{}).get("gsc","")   for u in urls]
 
     if mode.startswith("Emb"):
         model = load_embedder()
@@ -324,30 +335,28 @@ def semantic_backend_weighted(
             st.warning("Embeddings unavailable; falling back to TF-IDF.")
             mode = "TF-IDF"
         else:
-            Es = model.encode(slug_c, normalize_embeddings=True, show_progress_bar=False)
-            Et = model.encode(titl_c, normalize_embeddings=True, show_progress_bar=False)
-            Eh1= model.encode(h1_c,   normalize_embeddings=True, show_progress_bar=False)
-            Eg = model.encode(gsc_c,  normalize_embeddings=True, show_progress_bar=False)
-            Ed = model.encode(desc_c, normalize_embeddings=True, show_progress_bar=False)
-            Eh2= model.encode(h2_c,   normalize_embeddings=True, show_progress_bar=False)
-            M  = slug_w*Es + title_w*Et + h1_w*Eh1 + gsc_w*Eg + desc_w*Ed + h2_w*Eh2
-            # Row-normalize
-            norms = np.linalg.norm(M, axis=1, keepdims=True)
-            norms[norms==0] = 1.0
+            Es  = model.encode(slug_c, normalize_embeddings=True, show_progress_bar=False)
+            Et  = model.encode(titl_c, normalize_embeddings=True, show_progress_bar=False)
+            Ed  = model.encode(desc_c, normalize_embeddings=True, show_progress_bar=False)
+            Eh1 = model.encode(h1_c,   normalize_embeddings=True, show_progress_bar=False)
+            Eh2 = model.encode(h2_c,   normalize_embeddings=True, show_progress_bar=False)
+            Eg  = model.encode(gsc_c,  normalize_embeddings=True, show_progress_bar=False)
+            M   = slug_w*Es + title_w*Et + desc_w*Ed + h1_w*Eh1 + h2_w*Eh2 + gsc_w*Eg
+            norms = np.linalg.norm(M, axis=1, keepdims=True); norms[norms==0] = 1.0
             M = M / norms
             return ("emb", None, M, {u:i for i,u in enumerate(urls)})
 
     # TF-IDF backend (fit on combined text for stable vocab)
-    combined = [" ".join([slug_c[i], titl_c[i], h1_c[i], gsc_c[i], desc_c[i], h2_c[i]]) for i in range(len(urls))]
+    combined = [" ".join([slug_c[i], titl_c[i], desc_c[i], h1_c[i], h2_c[i], gsc_c[i]]) for i in range(len(urls))]
     vec = TfidfVectorizer(stop_words="english", min_df=1, max_features=80000)
     vec.fit(combined)
     Xs  = vec.transform(slug_c)
     Xt  = vec.transform(titl_c)
-    Xh1 = vec.transform(h1_c)
-    Xg  = vec.transform(gsc_c)
     Xd  = vec.transform(desc_c)
+    Xh1 = vec.transform(h1_c)
     Xh2 = vec.transform(h2_c)
-    X   = slug_w*Xs + title_w*Xt + h1_w*Xh1 + gsc_w*Xg + desc_w*Xd + h2_w*Xh2
+    Xg  = vec.transform(gsc_c)
+    X   = slug_w*Xs + title_w*Xt + desc_w*Xd + h1_w*Xh1 + h2_w*Xh2 + gsc_w*Xg
     return ("tfidf", vec, X, {u:i for i,u in enumerate(urls)})
 
 def semantic_sim_vector(kind, obj, mat, i_idx:int):
@@ -360,7 +369,7 @@ def assign_categories_semantic_weighted(
     df_pages: pd.DataFrame,
     categories: List[str],
     components: Dict[str, Dict[str,str]],
-    slug_w: float, title_w: float, h1_w: float, gsc_w: float, desc_w: float, h2_w: float,
+    slug_w: float, title_w: float, desc_w: float, h1_w: float, h2_w: float, gsc_w: float,
     mode: str = "TF-IDF"
 ) -> Tuple[Dict[str,str], Dict[str,float]]:
     if not categories:
@@ -370,7 +379,7 @@ def assign_categories_semantic_weighted(
         return {}, {}
 
     # Page vectors (weighted)
-    kind, obj, Xp, idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, desc_w, h2_w, mode)
+    kind, obj, Xp, idx = semantic_backend_weighted(components, urls, slug_w, title_w, desc_w, h1_w, h2_w, gsc_w, mode)
 
     # Category vectors
     cat_labels = [c.strip() for c in categories if c.strip()]
@@ -395,6 +404,55 @@ def assign_categories_semantic_weighted(
         {urls[i]: cat_labels[best[i]] for i in range(len(urls))},
         {urls[i]: float(scores[i])    for i in range(len(urls))}
     )
+
+# ---------- Contextual existing links map ----------
+def build_existing_contextual_map(
+    inlinks: pd.DataFrame,
+    keep_query: bool,
+    home_root: str,
+    valid_nodes: Optional[Set[str]] = None
+) -> Dict[str, Set[str]]:
+    """
+    Return {dst_url: {src_url,...}} for pages that ALREADY link *contextually* to dst.
+    Ignores menu/footer/breadcrumb/pagination.
+    """
+    src_col = pick_column(inlinks, INLINKS_SRC_CANDIDATES)
+    dst_col = pick_column(inlinks, INLINKS_DST_CANDIDATES)
+    if not src_col or not dst_col:
+        return {}
+
+    df = inlinks.copy()
+    df["src"] = df[src_col].map(lambda x: normalize_url(x, keep_query))
+    df["dst"] = df[dst_col].map(lambda x: normalize_url(x, keep_query))
+    df["src_host"] = df["src"].map(get_host)
+    df["dst_host"] = df["dst"].map(get_host)
+
+    # keep internal→internal
+    if home_root:
+        df = df[
+            df["src_host"].map(lambda h: is_internal_host(h, home_root)) &
+            df["dst_host"].map(lambda h: is_internal_host(h, home_root))
+        ]
+
+    # restrict to analyzed 200-only nodes if provided
+    if valid_nodes is not None:
+        df = df[df["src"].isin(valid_nodes) & df["dst"].isin(valid_nodes)]
+
+    # classify link placement; require contextual only
+    pos_col, path_col, elem_col, anch_col = detect_link_position_columns(df)
+    if not (pos_col or path_col or elem_col or anch_col):
+        # No position columns => cannot detect contextual; don't exclude anything.
+        return {}
+
+    df["_cls"] = df.apply(lambda r: classify_inlink_row(r, pos_col, path_col, elem_col, anch_col), axis=1)
+    df = df[df["_cls"] == "contextual"]
+
+    linkmap: Dict[str, Set[str]] = defaultdict(set)
+    for r in df.itertuples(index=False):
+        s, d = getattr(r, "src", ""), getattr(r, "dst", "")
+        if s and d:
+            linkmap[d].add(s)
+    return linkmap
 
 # ---------- Flags & Suggestions ----------
 def flag_pages(df: pd.DataFrame, low_pr_q: float, high_ch_q: float) -> pd.DataFrame:
@@ -450,7 +508,8 @@ def suggest_internal_links(
     use_link_budget: bool=False, cap_weight: float=0.20,
     low_pr_q: float=0.20, top_k_sources:int=5,
     semantic_mode:str="TF-IDF",
-    slug_w: float=1.0, title_w: float=1.0, h1_w: float=1.0, gsc_w: float=1.0, desc_w: float=0.7, h2_w: float=1.0
+    slug_w: float=1.0, title_w: float=1.0, desc_w: float=0.7, h1_w: float=1.0, h2_w: float=1.0, gsc_w: float=1.0,
+    existing_links: Optional[Dict[str, Set[str]]] = None   # contextual-only map
 ) -> pd.DataFrame:
     df=df_metrics.copy()
     pr_th = df["pagerank"].quantile(low_pr_q)
@@ -470,7 +529,7 @@ def suggest_internal_links(
     homepage_norm = normalize_url(homepage_url, keep_query=False)
 
     # Weighted semantic matrix
-    kind,obj,M,idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, desc_w, h2_w, semantic_mode)
+    kind,obj,M,idx = semantic_backend_weighted(components, urls, slug_w, title_w, desc_w, h1_w, h2_w, gsc_w, semantic_mode)
 
     pr_norm = df.set_index("url")["pagerank_norm"].reindex(urls).fillna(0.0).to_numpy()
     ch_norm = df.set_index("url")["cheirank_norm"].reindex(urls).fillna(0.0).to_numpy()
@@ -490,6 +549,12 @@ def suggest_internal_links(
         if exclude_homepage_source and homepage_norm in urls:
             allow[urls.index(homepage_norm)] = False
 
+        # Exclude sources that already link contextually to this target
+        if existing_links:
+            already = existing_links.get(t.url, set())
+            if already:
+                allow &= np.array([u not in already for u in urls], dtype=bool)
+
         t_cat = category_map.get(t.url,"")
         if same_category_only and t_cat:
             allow &= np.array([category_map.get(u,"")==t_cat for u in urls])
@@ -501,7 +566,7 @@ def suggest_internal_links(
         score = np.where(allow, score, -1.0)
 
         top_idx = score.argsort()[::-1][:top_k_sources]
-        cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cap={cap[j]:.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
+        cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cap={(cap[j] if use_link_budget else 0):.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
 
         toks=[w for w in re.findall(r"[a-z0-9\-]+", combined_texts.get(t.url,"")) if len(w)>2]
         anchor=" ".join([w for w,_ in Counter(toks).most_common(8)][:4])
@@ -513,7 +578,7 @@ def suggest_internal_links(
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v14)")
+st.title("SEO PageRank & CheiRank Analyzer (v15)")
 
 st.markdown("""
 **How this works (quick)**
@@ -521,10 +586,10 @@ st.markdown("""
 - **Graph:** internal links only (homepage sets domain scope).
 - **Homepage in suggestions:** controlled by checkbox (excluded by default).
 - **Scores:** PageRank (importance) and CheiRank (hubness).
-- **Semantics:** GSC queries + URL slug + Meta Title + H1 + Meta Description + H2 (all weighted).
+- **Semantics:** GSC queries + URL slug + Meta Title + **Meta Description** + H1 + **H2** (all weighted).
 - **Suggestion score:** 35% sim + 35% PR + 15% CH + 15% Ahrefs [+ Link budget if enabled].
-- **Category options:** Prefer same-category (+15% boost) or restrict to same-category only.
-- **Ahrefs DR/UR weighting:** optional quality weighting for external signal.
+- **Category options:** Prefer same-category (+15%) or restrict to same-category only.
+- **Dedupe:** Suggestions exclude sources that already link **contextually** to the target.
 """)
 
 with st.sidebar:
@@ -546,20 +611,19 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Semantics engine")
-    # Default to Embeddings (index=1), with graceful fallback warning if the packages aren't present
+    # Default to Embeddings (index=1), graceful fallback warning if packages aren't present
     sem_choice  = st.radio("Choose engine", ["TF-IDF (fast)","Embeddings (better, needs model)"], index=1)
     if sem_choice.startswith("Embeddings") and not _EMBED_READY:
         st.warning("Embeddings packages not available; falling back to TF-IDF unless installed (pip install sentence-transformers).")
 
     st.caption("**Weights** for similarity & categories")
-    # Default values exactly as in your screenshot
-    slug_w  = st.slider("Weight: URL slug",        0.0, 3.0, 1.50, 0.05)
-    title_w = st.slider("Weight: Meta Title",      0.0, 3.0, 1.20, 0.05)
-    h1_w    = st.slider("Weight: H1",              0.0, 3.0, 1.00, 0.05)
-    gsc_w   = st.slider("Weight: GSC queries",     0.0, 3.0, 1.00, 0.05)
-    # No tooltips on the next two, and positioned as requested
-    desc_w  = st.slider("Weight: Meta Description",0.0, 3.0, 0.70, 0.05)
-    h2_w    = st.slider("Weight: H2 headings",     0.0, 3.0, 1.00, 0.05)
+    # Order: slug, Title, Meta Description (just below Title), H1, H2 (just below H1), GSC
+    slug_w  = st.slider("Weight: URL slug",           0.0, 3.0, 1.50, 0.05)
+    title_w = st.slider("Weight: Meta Title",         0.0, 3.0, 1.20, 0.05)
+    desc_w  = st.slider("Weight: Meta Description",   0.0, 3.0, 0.70, 0.05)
+    h1_w    = st.slider("Weight: H1",                 0.0, 3.0, 1.00, 0.05)
+    h2_w    = st.slider("Weight: H2 headings",        0.0, 3.0, 1.00, 0.05)
+    gsc_w   = st.slider("Weight: GSC queries",        0.0, 3.0, 1.00, 0.05)
 
     st.markdown("---")
     st.subheader("Link budget")
@@ -591,6 +655,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
         if df_pages_non200.shape[0] > 0:
             st.info(f"Excluded {df_pages_non200.shape[0]} non-200 pages from analysis.")
 
+        # Ahrefs strength + personalization
         bl_strength = aggregate_backlinks(df_bl, keep_query, use_quality=use_quality)
         p_vec = bl_strength[bl_strength.index.isin(G.nodes())]
         personalization = (p_vec / p_vec.sum()).to_dict() if p_vec.sum() > 0 else None
@@ -611,13 +676,15 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
         df["pagerank_norm"] = df["pagerank"] / (df["pagerank"].sum() if df["pagerank"].sum()>0 else 1.0)
         df["cheirank_norm"] = df["cheirank"] / (df["cheirank"].sum() if df["cheirank"].sum()>0 else 1.0)
 
-        # Semantics: components + combined strings (for anchor hints)
-        gsc_sem   = build_gsc_semantics(df_gsc, keep_query=keep_query)
-        components= build_component_texts(df_pages, gsc_sem)
-        combined_texts = {u: " ".join([
-            components[u]["slug"], components[u]["title"], components[u]["h1"],
-            components[u]["gsc"], components[u]["desc"], components[u]["h2"]
-        ]) for u in components.keys()}
+        # Semantics components + combined strings (for anchor hints)
+        gsc_sem     = build_gsc_semantics(df_gsc, keep_query=keep_query)
+        components  = build_component_texts(df_pages, gsc_sem)
+        combined_texts = {
+            u: " ".join([
+                components[u]["slug"], components[u]["title"], components[u]["desc"],
+                components[u]["h1"], components[u]["h2"], components[u]["gsc"]
+            ]) for u in components.keys()
+        }
 
         # Categories (weighted)
         if categories:
@@ -625,7 +692,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 df_pages=df_pages,
                 categories=categories,
                 components=components,
-                slug_w=slug_w, title_w=title_w, h1_w=h1_w, gsc_w=gsc_w, desc_w=desc_w, h2_w=h2_w,
+                slug_w=slug_w, title_w=title_w, desc_w=desc_w, h1_w=h1_w, h2_w=h2_w, gsc_w=gsc_w,
                 mode=sem_choice
             )
         else:
@@ -634,6 +701,14 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
 
         # Flags
         df = flag_pages(df, low_pr_q=low_pr_q, high_ch_q=high_ch_q)
+
+        # Contextual existing links map (for dedupe)
+        existing_links_ctx = build_existing_contextual_map(
+            inlinks=df_in,
+            keep_query=keep_query,
+            home_root=home_root,
+            valid_nodes=set(df["url"])
+        )
 
         st.success("Analysis complete.")
 
@@ -705,7 +780,8 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 use_link_budget=use_cap,
                 cap_weight=cap_w,
                 semantic_mode=sem_choice,
-                slug_w=slug_w, title_w=title_w, h1_w=h1_w, gsc_w=gsc_w, desc_w=desc_w, h2_w=h2_w
+                slug_w=slug_w, title_w=title_w, desc_w=desc_w, h1_w=h1_w, h2_w=h2_w, gsc_w=gsc_w,
+                existing_links=existing_links_ctx
             )
             if sugg_df.empty:
                 st.info("No targets met the criteria for suggestions.")
