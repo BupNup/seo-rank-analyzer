@@ -345,9 +345,44 @@ def assign_categories_semantic_weighted(
 ) -> Tuple[Dict[str,str], Dict[str,float]]:
     if not categories:
         return {}, {}
-    urls = [u for u in components.keys()]
+    urls = list(components.keys())
     if not urls:
         return {}, {}
+
+    # Page vectors (weighted)
+    kind, obj, Xp, idx = semantic_backend_weighted(
+        components, urls, slug_w, title_w, h1_w, gsc_w, mode
+    )
+
+    cat_labels = [c.strip() for c in categories if c.strip()]
+    if not cat_labels:
+        return {u:"" for u in urls}, {u:0.0 for u in urls}
+
+    # Build category vectors in the SAME space; if embeddings unavailable, fall back to TF-IDF
+    if kind == "emb":
+        model = load_embedder()
+        if model is not None:
+            Xc = model.encode(cat_labels, normalize_embeddings=True, show_progress_bar=False)
+            sims = Xp @ Xc.T
+        else:
+            # Fallback: rebuild a TF-IDF space on page texts + categories
+            page_texts = [" ".join([components[u]["slug"], components[u]["title"], components[u]["h1"], components[u]["gsc"]]) for u in urls]
+            vec = TfidfVectorizer(stop_words="english", min_df=1, max_features=80000)
+            Xall = vec.fit_transform(page_texts + cat_labels)
+            Xp_t, Xc_t = Xall[:len(urls)], Xall[len(urls):]
+            sims = cosine_similarity(Xp_t, Xc_t)
+    else:
+        vec = obj  # the fitted TF-IDF vectorizer
+        Xc = vec.transform(cat_labels)
+        sims = cosine_similarity(Xp, Xc)
+
+    best = sims.argmax(axis=1)
+    scores = sims[np.arange(len(urls)), best]
+    return (
+        {urls[i]: cat_labels[best[i]] for i in range(len(urls))},
+        {urls[i]: float(scores[i])    for i in range(len(urls))}
+    )
+
 
     # Page vectors (weighted)
     kind, obj, Xp, idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, mode)
