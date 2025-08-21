@@ -34,8 +34,13 @@ GSC_IMPR_CANDS = ["Impressions","Impr","Impressions Total"]
 
 PAGE_TITLE_CANDS = ["Title 1","Title","Meta Title"]
 PAGE_H1_CANDS    = ["H1-1","H1"]
+PAGE_DESC_CANDS  = ["Meta Description 1","Meta Description","Meta description","Description"]
 
 STATUS_CODE_CANDS = ["Status Code","Status code","Status","HTTP Status","StatusCode","Response Codes"]
+
+def list_h2_columns(df: pd.DataFrame) -> List[str]:
+    # any column starting with H2, e.g., H2-1, H2-2 ...
+    return [c for c in df.columns if str(c).lower().startswith("h2")]
 
 # ---------- Helpers ----------
 @st.cache_data(show_spinner=False)
@@ -45,14 +50,25 @@ def sniff_encoding(file_bytes: bytes) -> str:
 @st.cache_data(show_spinner=False)
 def read_table(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read(); enc = sniff_encoding(raw); buf = io.BytesIO(raw)
-    try: return pd.read_csv(buf, sep=None, engine="python", encoding=enc)
-    except Exception: buf.seek(0); return pd.read_excel(buf)
+    try:
+        return pd.read_csv(buf, sep=None, engine="python", encoding=enc)
+    except Exception:
+        buf.seek(0); 
+        try:
+            return pd.read_excel(buf)
+        except Exception:
+            # final safe fallback: assume UTF-8 csv no sniff
+            buf.seek(0)
+            return pd.read_csv(buf, encoding="utf-8", engine="python")
 
 @st.cache_data(show_spinner=False)
 def read_gsc(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read(); enc = sniff_encoding(raw); buf = io.BytesIO(raw)
-    try: return pd.read_csv(buf, encoding=enc)
-    except Exception: buf.seek(0); return pd.read_excel(buf)
+    try:
+        return pd.read_csv(buf, encoding=enc)
+    except Exception:
+        buf.seek(0)
+        return pd.read_excel(buf)
 
 def _strip_fragment(u:str) -> str: return u.split("#",1)[0]
 def _strip_query(u:str, keep:bool) -> str: return u if keep else u.split("?",1)[0]
@@ -184,7 +200,7 @@ def build_internal_graph(
     return G, pages_200, pages_non200
 
 # ---------- Ahrefs aggregation (optional DR/UR quality) ----------
-def _pick_numeric(df, cands): 
+def _pick_numeric(df, cands):
     col = pick_column(df, cands)
     return pd.to_numeric(df[col], errors="coerce") if col else None
 
@@ -243,7 +259,7 @@ def compute_pagerank(G: nx.DiGraph, alpha: float, personalization: Optional[Dict
 def compute_cheirank(G: nx.DiGraph, alpha: float) -> Dict[str,float]:
     return compute_pagerank(G.reverse(copy=True), alpha=alpha, personalization=None)
 
-# ---------- Semantics (NEW: only slug + Title + H1 + GSC, with weights) ----------
+# ---------- Semantics (Slug + Title + H1 + GSC + Meta Description + H2) ----------
 def build_gsc_semantics(gsc: pd.DataFrame, keep_query: bool) -> pd.Series:
     if gsc is None or gsc.empty: return pd.Series(dtype=str)
     pg_col = pick_column(gsc, GSC_PAGE_CANDS); q_col = pick_column(gsc, GSC_QUERY_CANDS); i_col = pick_column(gsc, GSC_IMPR_CANDS)
@@ -256,10 +272,13 @@ def build_gsc_semantics(gsc: pd.DataFrame, keep_query: bool) -> pd.Series:
     return tmp.groupby("page")["rep"].apply(lambda x: " ".join(x)).astype(str)
 
 def build_component_texts(df_pages: pd.DataFrame, gsc_sem: pd.Series) -> Dict[str, Dict[str,str]]:
-    """Return per-url component texts: slug, title, h1, gsc (lowercased)."""
+    """Return per-url component texts: slug, title, h1, desc, h2, gsc (lowercased)."""
     url_col = pick_column(df_pages, URL_COL_CANDIDATES_PAGES)
     t_col   = pick_column(df_pages, PAGE_TITLE_CANDS)
     h1_col  = pick_column(df_pages, PAGE_H1_CANDS)
+    d_col   = pick_column(df_pages, PAGE_DESC_CANDS)
+    h2_cols = list_h2_columns(df_pages)
+
     out = {}
     for _, r in df_pages.iterrows():
         u = normalize_url(r.get(url_col,""), keep_query=False) if url_col else ""
@@ -268,8 +287,10 @@ def build_component_texts(df_pages: pd.DataFrame, gsc_sem: pd.Series) -> Dict[st
         slug = path.replace("/", " ").replace("-", " ").strip().lower()
         title = (str(r.get(t_col,"")) if t_col else "").lower()
         h1    = (str(r.get(h1_col,"")) if h1_col else "").lower()
+        desc  = (str(r.get(d_col,"")) if d_col else "").lower()
+        h2    = " ".join([str(r.get(c,"")) for c in h2_cols if pd.notna(r.get(c,""))]).lower()
         gsc   = (str(gsc_sem.get(u,"")) if isinstance(gsc_sem, pd.Series) else "").lower()
-        out[u] = {"slug":slug, "title":title, "h1":h1, "gsc":gsc}
+        out[u] = {"slug":slug, "title":title, "h1":h1, "desc":desc, "h2":h2, "gsc":gsc}
     return out
 
 @st.cache_resource(show_spinner=False)
@@ -281,53 +302,58 @@ def load_embedder(model_name="sentence-transformers/all-MiniLM-L6-v2"):
     except Exception:
         return None
 
-def _weights_ok(slug_w, title_w, h1_w, gsc_w):
-    s = float(slug_w) + float(title_w) + float(h1_w) + float(gsc_w)
-    if s <= 1e-9:  # avoid all-zero
-        return 1.0, 1.0, 1.0, 1.0
-    return float(slug_w), float(title_w), float(h1_w), float(gsc_w)
+def _weights_ok(slug_w, title_w, h1_w, gsc_w, desc_w, h2_w):
+    s = float(slug_w) + float(title_w) + float(h1_w) + float(gsc_w) + float(desc_w) + float(h2_w)
+    if s <= 1e-9:  # avoid all-zero collapse
+        # Keep desc/h2 tiny in fallback too
+        return (1.0, 1.0, 1.0, 1.0, 0.05, 0.10)
+    return float(slug_w), float(title_w), float(h1_w), float(gsc_w), float(desc_w), float(h2_w)
 
 def semantic_backend_weighted(
     components: Dict[str, Dict[str,str]],
     urls: List[str],
     slug_w: float, title_w: float, h1_w: float, gsc_w: float,
+    desc_w: float, h2_w: float,
     mode: str = "TF-IDF"
 ):
     """Return (kind, obj, matrix, index_map) where matrix is page vectors."""
-    slug_w, title_w, h1_w, gsc_w = _weights_ok(slug_w, title_w, h1_w, gsc_w)
+    slug_w, title_w, h1_w, gsc_w, desc_w, h2_w = _weights_ok(slug_w, title_w, h1_w, gsc_w, desc_w, h2_w)
 
     # Build component corpora aligned by urls
     slug_c = [components.get(u,{}).get("slug","")  for u in urls]
     titl_c = [components.get(u,{}).get("title","") for u in urls]
     h1_c   = [components.get(u,{}).get("h1","")    for u in urls]
     gsc_c  = [components.get(u,{}).get("gsc","")   for u in urls]
+    desc_c = [components.get(u,{}).get("desc","")  for u in urls]
+    h2_c   = [components.get(u,{}).get("h2","")    for u in urls]
 
-    if mode.startswith("Emb"):
+    if mode.lower().startswith("emb"):
         model = load_embedder()
         if model is None:
             st.warning("Embeddings unavailable; falling back to TF-IDF.")
-            mode = "TF-IDF"
         else:
-            Es = model.encode(slug_c, normalize_embeddings=True, show_progress_bar=False)
-            Et = model.encode(titl_c, normalize_embeddings=True, show_progress_bar=False)
-            Eh = model.encode(h1_c,   normalize_embeddings=True, show_progress_bar=False)
-            Eg = model.encode(gsc_c,  normalize_embeddings=True, show_progress_bar=False)
-            M  = slug_w*Es + title_w*Et + h1_w*Eh + gsc_w*Eg
-            # Row-normalize
-            norms = np.linalg.norm(M, axis=1, keepdims=True)
-            norms[norms==0] = 1.0
+            Es  = model.encode(slug_c, normalize_embeddings=True, show_progress_bar=False)
+            Et  = model.encode(titl_c, normalize_embeddings=True, show_progress_bar=False)
+            Eh1 = model.encode(h1_c,   normalize_embeddings=True, show_progress_bar=False)
+            Eg  = model.encode(gsc_c,  normalize_embeddings=True, show_progress_bar=False)
+            Ed  = model.encode(desc_c, normalize_embeddings=True, show_progress_bar=False)
+            Eh2 = model.encode(h2_c,   normalize_embeddings=True, show_progress_bar=False)
+            M   = slug_w*Es + title_w*Et + h1_w*Eh1 + gsc_w*Eg + desc_w*Ed + h2_w*Eh2
+            norms = np.linalg.norm(M, axis=1, keepdims=True); norms[norms==0] = 1.0
             M = M / norms
             return ("emb", None, M, {u:i for i,u in enumerate(urls)})
 
     # TF-IDF backend (fit on combined text for stable vocab)
-    combined = [" ".join([slug_c[i], titl_c[i], h1_c[i], gsc_c[i]]) for i in range(len(urls))]
+    combined = [" ".join([slug_c[i], titl_c[i], h1_c[i], gsc_c[i], desc_c[i], h2_c[i]]) for i in range(len(urls))]
     vec = TfidfVectorizer(stop_words="english", min_df=1, max_features=80000)
     vec.fit(combined)
-    Xs = vec.transform(slug_c)
-    Xt = vec.transform(titl_c)
-    Xh = vec.transform(h1_c)
-    Xg = vec.transform(gsc_c)
-    X  = slug_w*Xs + title_w*Xt + h1_w*Xh + gsc_w*Xg
+    Xs  = vec.transform(slug_c)
+    Xt  = vec.transform(titl_c)
+    Xh1 = vec.transform(h1_c)
+    Xg  = vec.transform(gsc_c)
+    Xd  = vec.transform(desc_c)
+    Xh2 = vec.transform(h2_c)
+    X   = slug_w*Xs + title_w*Xt + h1_w*Xh1 + gsc_w*Xg + desc_w*Xd + h2_w*Xh2
     return ("tfidf", vec, X, {u:i for i,u in enumerate(urls)})
 
 def semantic_sim_vector(kind, obj, mat, i_idx:int):
@@ -341,6 +367,7 @@ def assign_categories_semantic_weighted(
     categories: List[str],
     components: Dict[str, Dict[str,str]],
     slug_w: float, title_w: float, h1_w: float, gsc_w: float,
+    desc_w: float, h2_w: float,
     mode: str = "TF-IDF"
 ) -> Tuple[Dict[str,str], Dict[str,float]]:
     if not categories:
@@ -350,7 +377,7 @@ def assign_categories_semantic_weighted(
         return {}, {}
 
     # Page vectors (weighted)
-    kind, obj, Xp, idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, mode)
+    kind, obj, Xp, idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, desc_w, h2_w, mode)
 
     # Category vectors
     cat_labels = [c.strip() for c in categories if c.strip()]
@@ -360,7 +387,6 @@ def assign_categories_semantic_weighted(
     if kind == "emb":
         model = load_embedder()
         if model is None:
-            # Fallback to TF-IDF for categories if embeddings unavailable
             mode = "TF-IDF"
     if kind == "emb":
         Xc = load_embedder().encode(cat_labels, normalize_embeddings=True, show_progress_bar=False)
@@ -431,7 +457,8 @@ def suggest_internal_links(
     use_link_budget: bool=False, cap_weight: float=0.20,
     low_pr_q: float=0.20, top_k_sources:int=5,
     semantic_mode:str="TF-IDF",
-    slug_w: float=1.0, title_w: float=1.0, h1_w: float=1.0, gsc_w: float=1.0
+    slug_w: float=1.0, title_w: float=1.0, h1_w: float=1.0, gsc_w: float=1.0,
+    desc_w: float=0.05, h2_w: float=0.10
 ) -> pd.DataFrame:
     df=df_metrics.copy()
     pr_th = df["pagerank"].quantile(low_pr_q)
@@ -451,7 +478,7 @@ def suggest_internal_links(
     homepage_norm = normalize_url(homepage_url, keep_query=False)
 
     # Weighted semantic matrix
-    kind,obj,M,idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, semantic_mode)
+    kind,obj,M,idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, desc_w, h2_w, semantic_mode)
 
     pr_norm = df.set_index("url")["pagerank_norm"].reindex(urls).fillna(0.0).to_numpy()
     ch_norm = df.set_index("url")["cheirank_norm"].reindex(urls).fillna(0.0).to_numpy()
@@ -482,7 +509,7 @@ def suggest_internal_links(
         score = np.where(allow, score, -1.0)
 
         top_idx = score.argsort()[::-1][:top_k_sources]
-        cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cap={cap[j]:.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
+        cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cap={(cap[j] if use_link_budget else 0):.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
 
         toks=[w for w in re.findall(r"[a-z0-9\-]+", combined_texts.get(t.url,"")) if len(w)>2]
         anchor=" ".join([w for w,_ in Counter(toks).most_common(8)][:4])
@@ -494,27 +521,18 @@ def suggest_internal_links(
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v13)")
+st.title("SEO PageRank & CheiRank Analyzer (v14)")
 
 st.markdown("""
-
-**What this tool does:**
-- Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
-- Builds an **internal link graph** (homepage sets domain scope;).
-- Calculates **PageRank** (importance) and **CheiRank** (hubness).
-- Understands topics from **Full URL Slug + GSC queries + Meta Title + H1**. Default **TF-IDF**; **Embeddings** optional.
-- Assigns **categories** to pages from your category list.
-
-**How suggestions are ranked:**
-- Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
-- Optional: **Link budget** adds `PR / (outlinks + 1)`.
-
-**Outputs:**
-- Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
-- **Suggestions** per weak page: best source URLs (score, PR, CH, sim, capacity, category, anchor hint).
-
-➡️ **Need more details?** Read the full guide: **[Readme.txt](https://github.com/BupNup/seo-rank-analyzer/blob/main/Readme.txt)**
-
+**How this works (quick)**
+- **200-only analysis:** only URLs with HTTP **Status Code = 200** are analyzed.
+- **Graph:** internal links only (homepage sets domain scope).
+- **Homepage in suggestions:** controlled by checkbox (excluded by default).
+- **Scores:** PageRank (importance) and CheiRank (hubness).
+- **Semantics:** GSC queries + URL **slug** + **Meta Title** + **H1** + **Meta Description (low)** + **H2 (low)**.
+- **Suggestion score:** 35% sim + 35% PR + 15% CH + 15% Ahrefs [+ Link budget if enabled].
+- **Category options:** Prefer same-category (+15%) or restrict to same-category only.
+- **Ahrefs DR/UR weighting:** optional quality weighting for external signal.
 """)
 
 with st.sidebar:
@@ -540,12 +558,14 @@ with st.sidebar:
     if sem_choice.startswith("Embeddings") and not _EMBED_READY:
         st.warning("Embeddings packages not available; falling back to TF-IDF unless installed (pip install sentence-transformers).")
 
-    # NEW: component weights
-    st.caption("**Weights** for similarity & categories (default = 1.0 each)")
-    slug_w  = st.slider("Weight: URL slug", 0.0, 3.0, 1.0, 0.1)
-    title_w = st.slider("Weight: Meta Title", 0.0, 3.0, 1.0, 0.1)
-    h1_w    = st.slider("Weight: H1",        0.0, 3.0, 1.0, 0.1)
-    gsc_w   = st.slider("Weight: GSC queries",0.0, 3.0, 1.0, 0.1)
+    # Component weights (default = 1.0 for core; very low for desc/H2)
+    st.caption("**Weights** for similarity & categories")
+    slug_w  = st.slider("Weight: URL slug",         0.0, 3.0, 1.0, 0.1)
+    title_w = st.slider("Weight: Meta Title",       0.0, 3.0, 1.0, 0.1)
+    h1_w    = st.slider("Weight: H1",               0.0, 3.0, 1.0, 0.1)
+    gsc_w   = st.slider("Weight: GSC queries",      0.0, 3.0, 1.0, 0.1)
+    desc_w  = st.slider("Weight: Meta Description", 0.0, 3.0, 0.05, 0.05, help="Very low by default to avoid misclassification.")
+    h2_w    = st.slider("Weight: H2 headings",      0.0, 3.0, 0.10, 0.05, help="Low by default; raise for multi-section guides.")
 
     st.markdown("---")
     st.subheader("Link budget")
@@ -577,6 +597,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
         if df_pages_non200.shape[0] > 0:
             st.info(f"Excluded {df_pages_non200.shape[0]} non-200 pages from analysis.")
 
+        # Ahrefs strength + personalization
         bl_strength = aggregate_backlinks(df_bl, keep_query, use_quality=use_quality)
         p_vec = bl_strength[bl_strength.index.isin(G.nodes())]
         personalization = (p_vec / p_vec.sum()).to_dict() if p_vec.sum() > 0 else None
@@ -598,9 +619,14 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
         df["cheirank_norm"] = df["cheirank"] / (df["cheirank"].sum() if df["cheirank"].sum()>0 else 1.0)
 
         # Semantics: components + combined strings (for anchor hints)
-        gsc_sem   = build_gsc_semantics(df_gsc, keep_query=keep_query)
-        components= build_component_texts(df_pages, gsc_sem)
-        combined_texts = {u: " ".join([components[u]["slug"], components[u]["title"], components[u]["h1"], components[u]["gsc"]]) for u in components.keys()}
+        gsc_sem     = build_gsc_semantics(df_gsc, keep_query=keep_query)
+        components  = build_component_texts(df_pages, gsc_sem)
+        combined_texts = {
+            u: " ".join([
+                components[u]["slug"], components[u]["title"], components[u]["h1"],
+                components[u]["desc"], components[u]["h2"], components[u]["gsc"]
+            ]) for u in components.keys()
+        }
 
         # Categories (weighted)
         if categories:
@@ -609,6 +635,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 categories=categories,
                 components=components,
                 slug_w=slug_w, title_w=title_w, h1_w=h1_w, gsc_w=gsc_w,
+                desc_w=desc_w, h2_w=h2_w,
                 mode=sem_choice
             )
         else:
@@ -688,7 +715,8 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 use_link_budget=use_cap,
                 cap_weight=cap_w,
                 semantic_mode=sem_choice,
-                slug_w=slug_w, title_w=title_w, h1_w=h1_w, gsc_w=gsc_w
+                slug_w=slug_w, title_w=title_w, h1_w=h1_w, gsc_w=gsc_w,
+                desc_w=desc_w, h2_w=h2_w
             )
             if sugg_df.empty:
                 st.info("No targets met the criteria for suggestions.")
