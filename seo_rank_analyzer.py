@@ -201,8 +201,8 @@ def aggregate_backlinks(backlinks: pd.DataFrame, keep_query: bool, use_quality: 
     if use_quality:
         dr = _pick_numeric(df, AHREFS_DR_CANDS)  # 0–100
         ur = _pick_numeric(df, AHREFS_UR_CANDS)  # 0–100
-dr_w = np.sqrt(np.clip(dr.fillna(0.0), 0, 100)/100.0) if dr is not None else None
-ur_w = np.sqrt(np.clip(ur.fillna(0.0), 0, 100)/100.0) if ur is not None else None
+        dr_w = np.sqrt(np.clip((dr or 0).fillna(0.0), 0, 100)/100.0) if dr is not None else None
+        ur_w = np.sqrt(np.clip((ur or 0).fillna(0.0), 0, 100)/100.0) if ur is not None else None
         if dr_w is not None and ur_w is not None:
             qual = (dr_w * ur_w).replace(0, 1e-6)
         elif dr_w is not None:
@@ -345,44 +345,9 @@ def assign_categories_semantic_weighted(
 ) -> Tuple[Dict[str,str], Dict[str,float]]:
     if not categories:
         return {}, {}
-    urls = list(components.keys())
+    urls = [u for u in components.keys()]
     if not urls:
         return {}, {}
-
-    # Page vectors (weighted)
-    kind, obj, Xp, idx = semantic_backend_weighted(
-        components, urls, slug_w, title_w, h1_w, gsc_w, mode
-    )
-
-    cat_labels = [c.strip() for c in categories if c.strip()]
-    if not cat_labels:
-        return {u:"" for u in urls}, {u:0.0 for u in urls}
-
-    # Build category vectors in the SAME space; if embeddings unavailable, fall back to TF-IDF
-    if kind == "emb":
-        model = load_embedder()
-        if model is not None:
-            Xc = model.encode(cat_labels, normalize_embeddings=True, show_progress_bar=False)
-            sims = Xp @ Xc.T
-        else:
-            # Fallback: rebuild a TF-IDF space on page texts + categories
-            page_texts = [" ".join([components[u]["slug"], components[u]["title"], components[u]["h1"], components[u]["gsc"]]) for u in urls]
-            vec = TfidfVectorizer(stop_words="english", min_df=1, max_features=80000)
-            Xall = vec.fit_transform(page_texts + cat_labels)
-            Xp_t, Xc_t = Xall[:len(urls)], Xall[len(urls):]
-            sims = cosine_similarity(Xp_t, Xc_t)
-    else:
-        vec = obj  # the fitted TF-IDF vectorizer
-        Xc = vec.transform(cat_labels)
-        sims = cosine_similarity(Xp, Xc)
-
-    best = sims.argmax(axis=1)
-    scores = sims[np.arange(len(urls)), best]
-    return (
-        {urls[i]: cat_labels[best[i]] for i in range(len(urls))},
-        {urls[i]: float(scores[i])    for i in range(len(urls))}
-    )
-
 
     # Page vectors (weighted)
     kind, obj, Xp, idx = semantic_backend_weighted(components, urls, slug_w, title_w, h1_w, gsc_w, mode)
@@ -613,13 +578,8 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             st.info(f"Excluded {df_pages_non200.shape[0]} non-200 pages from analysis.")
 
         bl_strength = aggregate_backlinks(df_bl, keep_query, use_quality=use_quality)
-# Ahrefs → personalization (must include ALL nodes; zeros allowed)
-bl_strength = aggregate_backlinks(df_bl, keep_query, use_quality=use_quality)
-
-pers = {n: float(bl_strength.get(n, 0.0)) for n in G.nodes()}
-s = sum(pers.values())
-personalization = None if s == 0 else {n: v / s for n, v in pers.items()}
-
+        p_vec = bl_strength[bl_strength.index.isin(G.nodes())]
+        personalization = (p_vec / p_vec.sum()).to_dict() if p_vec.sum() > 0 else None
 
         pr = compute_pagerank(G, alpha=alpha, personalization=personalization)
         ch = compute_cheirank(G, alpha=alpha)
