@@ -373,8 +373,8 @@ def assign_categories_semantic_weighted(
     mode: str = "TF-IDF"
 ) -> Tuple[Dict[str,str], Dict[str,float]]:
     """
-    Tags each URL with the best-matching category (for reporting).
-    Note: Categories are NOT used in suggestion scoring.
+    Tags each URL with the best-matching category (for reporting only).
+    Categories are NOT used in suggestion scoring.
     """
     if not categories:
         return {}, {}
@@ -458,6 +458,68 @@ def build_existing_contextual_map(
             linkmap[d].add(s)
     return linkmap
 
+# ---------- Existing links → target (detailed lists for UI) ----------
+def _col_or_blank(df: pd.DataFrame, col: Optional[str]) -> pd.Series:
+    if col and col in df.columns:
+        return df[col]
+    return pd.Series([""]*len(df), index=df.index)
+
+def existing_links_to_target_dfs(
+    inlinks: pd.DataFrame,
+    target_url: str,
+    keep_query: bool,
+    home_root: str,
+    valid_nodes: Optional[Set[str]] = None
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Return three DataFrames (contextual, menu_footer, unknown) of existing internal links to target.
+    Columns: src, dst, anchor, position, element, path
+    """
+    src_col = pick_column(inlinks, INLINKS_SRC_CANDIDATES)
+    dst_col = pick_column(inlinks, INLINKS_DST_CANDIDATES)
+    if not src_col or not dst_col:
+        return (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+
+    df = inlinks.copy()
+    df["src"] = df[src_col].map(lambda x: normalize_url(x, keep_query))
+    df["dst"] = df[dst_col].map(lambda x: normalize_url(x, keep_query))
+    df["src_host"] = df["src"].map(get_host)
+    df["dst_host"] = df["dst"].map(get_host)
+
+    # internal only + target match
+    if home_root:
+        df = df[
+            df["src_host"].map(lambda h: is_internal_host(h, home_root)) &
+            df["dst_host"].map(lambda h: is_internal_host(h, home_root))
+        ]
+    if valid_nodes is not None:
+        df = df[df["src"].isin(valid_nodes) & df["dst"].isin(valid_nodes)]
+
+    target_norm = normalize_url(target_url, keep_query)
+    df = df[df["dst"] == target_norm]
+
+    # classify
+    pos_col, path_col, elem_col, anch_col = detect_link_position_columns(df)
+    if pos_col or path_col or elem_col or anch_col:
+        df["_cls"] = df.apply(lambda r: classify_inlink_row(r, pos_col, path_col, elem_col, anch_col), axis=1)
+    else:
+        df["_cls"] = "unknown"
+
+    view = pd.DataFrame({
+        "src": df["src"],
+        "dst": df["dst"],
+        "anchor": _col_or_blank(df, anch_col),
+        "position": _col_or_blank(df, pos_col),
+        "element": _col_or_blank(df, elem_col),
+        "path": _col_or_blank(df, path_col),
+        "class": df["_cls"]
+    })
+
+    ctx = view[view["class"]=="contextual"].drop(columns=["class"]).drop_duplicates()
+    mf  = view[view["class"]=="menu_footer"].drop(columns=["class"]).drop_duplicates()
+    unk = view[~view["class"].isin(["contextual","menu_footer"])].drop(columns=["class"]).drop_duplicates()
+    return (ctx, mf, unk)
+
 # ---------- Flags & Suggestions ----------
 def flag_pages(df: pd.DataFrame, low_pr_q: float, high_ch_q: float) -> pd.DataFrame:
     df = df.copy()
@@ -504,11 +566,8 @@ def _dynamic_candidate_indices(score: np.ndarray, urls: List[str], allow_mask: n
                                min_sim: float, min_pr_quantile: float,
                                max_suggestions: int | None):
     """Return indices of candidates after applying semantic + PR thresholds, ordered by score."""
-    # apply allow mask
     ok = allow_mask.copy()
-    # semantic threshold
     ok &= (sims >= float(min_sim))
-    # PR threshold relative to available sources
     if ok.any():
         pr_pool = pr_norm[ok]
         th = np.quantile(pr_pool, float(min_pr_quantile)) if pr_pool.size > 0 else 0.0
@@ -629,18 +688,18 @@ def suggest_internal_links(
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer (v16)")
+st.title("SEO PageRank & CheiRank Analyzer (v17)")
 
 st.markdown("""
 **What this tool does**
-- Analyzes **HTTP 200** internal pages only; graph constrained by your homepage.
+- Analyzes **HTTP 200** internal pages; graph scoped by your homepage.
 - Computes **PageRank** (importance) and **CheiRank** (hubness).
-- Semantics from **GSC queries + URL slug + Meta Title + Meta Description + H1 + H2** (TF-IDF or Embeddings).
-- **Category tagging only:** each page is tagged with the most similar category you provide, **but categories are not used to rank suggestions**.
+- Semantics from **GSC + URL slug + Meta Title + Meta Description + H1 + H2** (TF-IDF or Embeddings).
+- **Category tagging only** (for reporting) — categories are **not** used in suggestion scoring.
 
 **Suggestion scoring (reweighted):**
 - **50% PR_norm + 30% similarity + 10% CH_norm + 10% Ahrefs** (+ optional link budget).
-- Dynamic count: candidates must pass **min semantic** and **min PR** thresholds; otherwise you'll see a note that nothing strong was found.
+- Dynamic: candidates must pass **min similarity** and **min PR** thresholds. If none pass, you’ll see a clear note.
 """)
 
 with st.sidebar:
@@ -664,7 +723,7 @@ with st.sidebar:
     if sem_choice.startswith("Embeddings") and not _EMBED_READY:
         st.warning("Embeddings packages not available; falling back to TF-IDF unless installed (pip install sentence-transformers).")
 
-    st.caption("**Weights for similarity & categories** (ordering reflects influence)")
+    st.caption("**Weights for similarity & categories**")
     slug_w  = st.slider("Weight: URL slug",           0.0, 3.0, 1.50, 0.05)
     title_w = st.slider("Weight: Meta Title",         0.0, 3.0, 1.20, 0.05)
     desc_w  = st.slider("Weight: Meta Description",   0.0, 3.0, 0.70, 0.05)
@@ -749,7 +808,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
         # Flags
         df = flag_pages(df, low_pr_q=low_pr_q, high_ch_q=high_ch_q)
 
-        # Contextual existing links map (for dedupe)
+        # Contextual existing links map (for dedupe in suggestions)
         existing_links_ctx = build_existing_contextual_map(
             inlinks=df_in,
             keep_query=keep_query,
@@ -834,7 +893,6 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             if sugg_df.empty:
                 st.info("No flagged targets met the criteria for suggestions.")
             else:
-                # If any row has no suggestions, surface a note inline
                 no_sugg = sugg_df["suggestions"].fillna("").eq("").sum()
                 if no_sugg > 0:
                     st.warning(f"{no_sugg} target(s) had no strong sources (failed similarity/PR thresholds).")
@@ -862,6 +920,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 if target_clean not in df["url"].values:
                     st.error("URL not found among analyzed HTTP 200 pages (check domain/normalization).")
                 else:
+                    # Suggestions
                     on_demand = suggest_internal_links(
                         df_metrics=df,
                         components=components,
@@ -881,10 +940,50 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                     if on_demand.empty or on_demand["suggestions"].fillna("").eq("").all():
                         st.info("No strong internal sources found (didn’t meet similarity/PR thresholds). Try lowering thresholds.")
                     else:
+                        st.markdown("**Suggestions**")
                         st.dataframe(on_demand, use_container_width=True)
                         st.download_button("Download on-demand CSV",
                                            on_demand.to_csv(index=False).encode("utf-8"),
                                            "internal_link_suggestions_on_demand.csv", "text/csv")
+
+                    # Existing links to this target
+                    st.markdown("---")
+                    st.subheader("Existing internal links → this target")
+                    ctx_df, mf_df, unk_df = existing_links_to_target_dfs(
+                        inlinks=df_in,
+                        target_url=target_clean,
+                        keep_query=keep_query,
+                        home_root=home_root,
+                        valid_nodes=set(df["url"])
+                    )
+
+                    # Contextual (what you care about)
+                    st.markdown("**Contextual links (count: {})**".format(len(ctx_df)))
+                    if ctx_df.empty:
+                        st.info("No contextual internal links currently point to this page.")
+                    else:
+                        st.dataframe(ctx_df.sort_values("src"), use_container_width=True, height=min(500, 80 + 28*len(ctx_df)))
+                        st.download_button("Download contextual links CSV",
+                                           ctx_df.to_csv(index=False).encode("utf-8"),
+                                           "existing_links_contextual.csv", "text/csv")
+
+                    # Menu/footer (extra transparency)
+                    st.markdown("**Menu/Footer & similar (count: {})**".format(len(mf_df)))
+                    if mf_df.empty:
+                        st.caption("None detected.")
+                    else:
+                        st.dataframe(mf_df.sort_values("src"), use_container_width=True, height=min(400, 80 + 28*len(mf_df)))
+                        st.download_button("Download menu/footer links CSV",
+                                           mf_df.to_csv(index=False).encode("utf-8"),
+                                           "existing_links_menufooter.csv", "text/csv")
+
+                    # Unknown/unclassified (rare; when position columns missing)
+                    if len(unk_df) > 0:
+                        st.markdown("**Unclassified (no position data) — FYI (count: {})**".format(len(unk_df)))
+                        st.dataframe(unk_df.sort_values("src"), use_container_width=True, height=min(300, 80 + 28*len(unk_df)))
+                        st.download_button("Download unclassified links CSV",
+                                           unk_df.to_csv(index=False).encode("utf-8"),
+                                           "existing_links_unclassified.csv", "text/csv")
 
         st.markdown("---")
         st.subheader("Download results")
