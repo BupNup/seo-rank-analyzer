@@ -211,8 +211,8 @@ def aggregate_backlinks(backlinks: pd.DataFrame, keep_query: bool, use_quality: 
     base = pd.to_numeric(df[grp_col], errors="coerce").fillna(1.0) if grp_col else pd.Series(1.0, index=df.index)
 
     if use_quality:
-        dr = _pick_numeric(df, AHREFS_DR_CANDS)  # 0–100
-        ur = _pick_numeric(df, AHREFS_UR_CANDS)  # 0–100
+        dr = _pick_numeric(df, AHREFS_DR_CANDS)
+        ur = _pick_numeric(df, AHREFS_UR_CANDS)
         dr_w = np.sqrt(np.clip((dr or 0).fillna(0.0), 0, 100)/100.0) if dr is not None else None
         ur_w = np.sqrt(np.clip((ur or 0).fillna(0.0), 0, 100)/100.0) if ur is not None else None
         if dr_w is not None and ur_w is not None:
@@ -346,7 +346,7 @@ def semantic_backend_weighted(
             M = M / norms
             return ("emb", None, M, {u:i for i,u in enumerate(urls)})
 
-    # TF-IDF backend (fit on combined text for stable vocab)
+    # TF-IDF backend
     combined = [" ".join([slug_c[i], titl_c[i], desc_c[i], h1_c[i], h2_c[i], gsc_c[i]]) for i in range(len(urls))]
     vec = TfidfVectorizer(stop_words="english", min_df=1, max_features=80000)
     vec.fit(combined)
@@ -372,6 +372,10 @@ def assign_categories_semantic_weighted(
     slug_w: float, title_w: float, desc_w: float, h1_w: float, h2_w: float, gsc_w: float,
     mode: str = "TF-IDF"
 ) -> Tuple[Dict[str,str], Dict[str,float]]:
+    """
+    Tags each URL with the best-matching category (for reporting).
+    Note: Categories are NOT used in suggestion scoring.
+    """
     if not categories:
         return {}, {}
     urls = [u for u in components.keys()]
@@ -495,30 +499,69 @@ def explode_suggestions(sugg_df: pd.DataFrame) -> pd.DataFrame:
                          "anchor_hint":r.anchor_hint,"source_rank":rank, **parse_suggestion_line(line)})
     return pd.DataFrame(rows)
 
+def _dynamic_candidate_indices(score: np.ndarray, urls: List[str], allow_mask: np.ndarray,
+                               sims: np.ndarray, pr_norm: np.ndarray,
+                               min_sim: float, min_pr_quantile: float,
+                               max_suggestions: int | None):
+    """Return indices of candidates after applying semantic + PR thresholds, ordered by score."""
+    # apply allow mask
+    ok = allow_mask.copy()
+    # semantic threshold
+    ok &= (sims >= float(min_sim))
+    # PR threshold relative to available sources
+    if ok.any():
+        pr_pool = pr_norm[ok]
+        th = np.quantile(pr_pool, float(min_pr_quantile)) if pr_pool.size > 0 else 0.0
+        ok &= (pr_norm >= th)
+    cand_idx = np.where(ok)[0]
+    if cand_idx.size == 0:
+        return []
+    ordered = cand_idx[np.argsort(score[cand_idx])[::-1]]
+    if max_suggestions is None:
+        return ordered.tolist()
+    return ordered[:int(max_suggestions)].tolist()
+
+def _anchor_hint_for(u: str, combined_texts: Dict[str,str]) -> str:
+    toks=[w for w in re.findall(r"[a-z0-9\-]+", combined_texts.get(u,"")) if len(w)>2]
+    from collections import Counter
+    return " ".join([w for w,_ in Counter(toks).most_common(8)][:4])
+
 def suggest_internal_links(
     df_metrics: pd.DataFrame,
     components: Dict[str, Dict[str,str]],
     combined_texts: Dict[str,str],
-    category_map: Dict[str,str],
-    prefer_same_category: bool,
-    same_category_only: bool,
+    category_map: Dict[str,str],       # kept only for reporting
     homepage_url: str,
     exclude_homepage_source: bool = True,
-    backlink_weight: float=0.15, pr_weight: float=0.35, ch_weight: float=0.15, sem_weight: float=0.35,
+    # weights (favor PR more)
+    backlink_weight: float=0.10, pr_weight: float=0.50, ch_weight: float=0.10, sem_weight: float=0.30,
     use_link_budget: bool=False, cap_weight: float=0.20,
-    low_pr_q: float=0.20, top_k_sources:int=5,
+    # thresholds (dynamic suggestion count)
+    min_sim: float=0.40, min_pr_quantile: float=0.50, max_suggestions: Optional[int]=5,
     semantic_mode:str="TF-IDF",
     slug_w: float=1.0, title_w: float=1.0, desc_w: float=0.7, h1_w: float=1.0, h2_w: float=1.0, gsc_w: float=1.0,
-    existing_links: Optional[Dict[str, Set[str]]] = None   # contextual-only map
+    existing_links: Optional[Dict[str, Set[str]]] = None,   # contextual-only map
+    only_targets: Optional[List[str]] = None,               # if provided, suggest only for these URLs
+    reason_filter: bool = True                              # if True, restrict to flagged pages; if False, ignore flags
 ) -> pd.DataFrame:
     df=df_metrics.copy()
-    pr_th = df["pagerank"].quantile(low_pr_q)
-    df["reason"]=""
-    df.loc[df["inlinks"]==0,"reason"] += "Orphan; "
-    df.loc[df["pagerank"]<=pr_th,"reason"] += "Low PR; "
-    df.loc[(df["backlinks_refcnt"]>0)&(df["pagerank"]<=pr_th),"reason"] += "Has backlinks, needs internal links; "
-    df["reason"]=df["reason"].str.strip()
-    targets=df[df["reason"]!=""].copy()
+
+    # Determine targets
+    if reason_filter:
+        pr_th = df["pagerank"].quantile(0.20) if df["pagerank"].notna().any() else 0.0
+        df["reason"]=""
+        df.loc[df["inlinks"]==0,"reason"] += "Orphan; "
+        df.loc[df["pagerank"]<=pr_th,"reason"] += "Low PR; "
+        df.loc[(df["backlinks_refcnt"]>0)&(df["pagerank"]<=pr_th),"reason"] += "Has backlinks, needs internal links; "
+        df["reason"]=df["reason"].str.strip()
+        targets=df[df["reason"]!=""].copy()
+    else:
+        df["reason"]=""  # on-demand use-case
+        targets=df.copy()
+
+    if only_targets:
+        targets = targets[targets["url"].isin([normalize_url(u, keep_query=False) for u in only_targets])]
+
     if targets.empty:
         return pd.DataFrame(columns=["target","category","reason","pagerank","cheirank","backlinks","inlinks","anchor_hint","suggestions"])
 
@@ -539,11 +582,13 @@ def suggest_internal_links(
     cap = (pr_norm / (out_deg + 1.0)) if use_link_budget else np.zeros_like(pr_norm)
     if use_link_budget and cap.max()>0: cap = cap / cap.max()
 
-    rows=[]; from collections import Counter
+    rows=[]
     for t in targets.itertuples(index=False):
-        if t.url not in idx: continue
+        if t.url not in idx:  # target must be in analyzed set
+            continue
         i = idx[t.url]; sims = semantic_sim_vector(kind, obj, M, i)
 
+        # Scoring (categories NOT used)
         score = (sem_weight*sims + pr_weight*pr_norm + ch_weight*ch_norm + backlink_weight*bl_norm + (cap_weight*cap if use_link_budget else 0))
         allow = np.ones(len(urls), dtype=bool); allow[i]=False
         if exclude_homepage_source and homepage_norm in urls:
@@ -555,51 +600,49 @@ def suggest_internal_links(
             if already:
                 allow &= np.array([u not in already for u in urls], dtype=bool)
 
-        t_cat = category_map.get(t.url,"")
-        if same_category_only and t_cat:
-            allow &= np.array([category_map.get(u,"")==t_cat for u in urls])
-        elif prefer_same_category and t_cat:
-            same_mask = np.array([category_map.get(u,"")==t_cat for u in urls])
-            score = np.where(same_mask, score*1.15, score)  # +15% boost
-
-        score = np.where(out_deg>0, score, score*0.5)  # soft penalty for sources with 0 outlinks
+        # Soft penalty for zero outlinks (router potential)
+        score = np.where(out_deg>0, score, score*0.5)
+        # Disallow masked
         score = np.where(allow, score, -1.0)
 
-        top_idx = score.argsort()[::-1][:top_k_sources]
-        cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.3f} | CH={ch_norm[j]:.3f} | sim={sims[j]:.3f} | cap={(cap[j] if use_link_budget else 0):.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
+        top_idx = _dynamic_candidate_indices(score, urls, allow, sims, pr_norm,
+                                             min_sim=min_sim, min_pr_quantile=min_pr_quantile,
+                                             max_suggestions=max_suggestions)
 
-        toks=[w for w in re.findall(r"[a-z0-9\-]+", combined_texts.get(t.url,"")) if len(w)>2]
-        anchor=" ".join([w for w,_ in Counter(toks).most_common(8)][:4])
+        if len(top_idx) == 0:
+            cands = []  # dynamic: none found
+        else:
+            cands = [f"{urls[j]} | score={score[j]:.3f} | PR={pr_norm[j]:.4f} | CH={ch_norm[j]:.4f} | sim={sims[j]:.3f} | cap={(cap[j] if use_link_budget else 0):.3f} | cat={category_map.get(urls[j],'')}" for j in top_idx]
 
-        rows.append({"target":t.url,"category":t_cat,"reason":t.reason,"pagerank":t.pagerank,
-                     "cheirank":t.cheirank,"backlinks":t.backlinks_refcnt,"inlinks":t.inlinks,
-                     "anchor_hint":anchor,"suggestions":"\n".join(cands)})
+        anchor=_anchor_hint_for(t.url, combined_texts)
+
+        rows.append({"target":t.url,
+                     "category":category_map.get(t.url,""),
+                     "reason":getattr(t,"reason",""),
+                     "pagerank":getattr(t,"pagerank",0.0),
+                     "cheirank":getattr(t,"cheirank",0.0),
+                     "backlinks":getattr(t,"backlinks_refcnt",0.0),
+                     "inlinks":getattr(t,"inlinks",0),
+                     "anchor_hint":anchor,
+                     "suggestions":"\n".join(cands)})
     return pd.DataFrame(rows)
 
 # ---------- UI ----------
 st.set_page_config(page_title="SEO PageRank & CheiRank Analyzer", layout="wide")
-st.title("SEO PageRank & CheiRank Analyzer")
+st.title("SEO PageRank & CheiRank Analyzer (v16)")
 
 st.markdown("""
+**What this tool does**
+- Analyzes **HTTP 200** internal pages only; graph constrained by your homepage.
+- Computes **PageRank** (importance) and **CheiRank** (hubness).
+- Semantics from **GSC queries + URL slug + Meta Title + Meta Description + H1 + H2** (TF-IDF or Embeddings).
+- **Category tagging only:** each page is tagged with the most similar category you provide, **but categories are not used to rank suggestions**.
 
-**What this tool does:**
-- Reads **4 files**: Screaming Frog **Pages** + **All Inlinks**, **Ahrefs Backlinks**, and **GSC**.
-- Builds an **internal link graph** (homepage sets domain scope;).
-- Calculates **PageRank** (importance) and **CheiRank** (hubness).
-- Understands topics from **GSC queries + Title + Meta + H1 + H2**. Default **TF-IDF**; **Embeddings** optional.
-- Assigns **categories** to pages from your category list.
-
-**How suggestions are ranked:**
-- Score = **35%** semantic similarity + **35%** PageRank + **15%** CheiRank + **15%** Ahrefs  
-- Optional: **Link budget** adds `PR / (outlinks + 1)`.
-
-**Outputs:**
-- Problem sets: **orphans**, **low PR**, **backlinks but low PR**, **high CheiRank** hubs.
-- **Suggestions** per weak page: best source URLs (score, PR, CH, sim, capacity, category, anchor hint).
-
-➡️ **Need more details?** Read the full guide: **[Readme.txt](https://github.com/BupNup/seo-rank-analyzer/blob/main/Readme.txt)**
-
+**Suggestion scoring (reweighted):**
+- **50% PR_norm + 30% similarity + 10% CH_norm + 10% Ahrefs** (+ optional link budget).
+- Dynamic count: candidates must pass **min semantic** and **min PR** thresholds; otherwise you'll see a note that nothing strong was found.
 """)
+
 with st.sidebar:
     st.header("Settings")
     homepage_input = st.text_input("Full homepage URL", value="", placeholder="https://www.example.com/", help="Sets domain scope so links are internal.")
@@ -608,8 +651,6 @@ with st.sidebar:
 
     cats_text = st.text_area("Main categories (one per line or comma-separated)", value="")
     categories  = [c.strip() for c in re.split(r"[\n,]+", cats_text) if c.strip()]
-    prefer_same = st.checkbox("Prefer same-category sources (+15%)", value=True)
-    same_only   = st.checkbox("Restrict to same category only", value=False)
 
     link_scope  = st.selectbox("Which links should count for PR?", ["all","contextual","menu_footer"], index=1)
     keep_query  = st.checkbox("Keep URL query parameters", value=False)
@@ -619,13 +660,11 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Semantics engine")
-    # Default to Embeddings (index=1), graceful fallback warning if packages aren't present
     sem_choice  = st.radio("Choose engine", ["TF-IDF (fast)","Embeddings (better, needs model)"], index=1)
     if sem_choice.startswith("Embeddings") and not _EMBED_READY:
         st.warning("Embeddings packages not available; falling back to TF-IDF unless installed (pip install sentence-transformers).")
 
-    st.caption("**Weights** for similarity & categories")
-    # Order: slug, Title, Meta Description (just below Title), H1, H2 (just below H1), GSC
+    st.caption("**Weights for similarity & categories** (ordering reflects influence)")
     slug_w  = st.slider("Weight: URL slug",           0.0, 3.0, 1.50, 0.05)
     title_w = st.slider("Weight: Meta Title",         0.0, 3.0, 1.20, 0.05)
     desc_w  = st.slider("Weight: Meta Description",   0.0, 3.0, 0.70, 0.05)
@@ -694,7 +733,7 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
             ]) for u in components.keys()
         }
 
-        # Categories (weighted)
+        # Category tagging (NOT used in scoring)
         if categories:
             cat_map, cat_scores = assign_categories_semantic_weighted(
                 df_pages=df_pages,
@@ -722,7 +761,8 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
 
         tabs = st.tabs([
             "Overview","Low PR candidates","Orphans","Backlinks but low PR",
-            "Link hubs (high CheiRank)","All pages (200 only)","Excluded non-200 pages","Menu/Footer links (debug)","Suggestions"
+            "Link hubs (high CheiRank)","All pages (200 only)","Excluded non-200 pages",
+            "Menu/Footer links (debug)","Suggestions (flagged)","On-demand suggestions"
         ])
 
         with tabs[0]:
@@ -773,35 +813,78 @@ if pages_file and inlinks_file and backlinks_file and gsc_file and homepage_inpu
                 st.info("No link position/path columns found in Inlinks to classify.")
 
         with tabs[8]:
-            st.subheader("Internal link suggestions")
+            st.subheader("Internal link suggestions (flagged pages)")
             sugg_df = suggest_internal_links(
                 df_metrics=df,
                 components=components,
                 combined_texts=combined_texts,
                 category_map=cat_map,
-                prefer_same_category=prefer_same,
-                same_category_only=same_only,
                 homepage_url=homepage_input,
                 exclude_homepage_source=exclude_home_src,
-                low_pr_q=low_pr_q,
-                top_k_sources=5,
-                use_link_budget=use_cap,
-                cap_weight=cap_w,
+                # favor PR more + dynamic thresholds
+                backlink_weight=0.10, pr_weight=0.50, ch_weight=0.10, sem_weight=0.30,
+                use_link_budget=use_cap, cap_weight=cap_w,
+                min_sim=0.40, min_pr_quantile=0.50, max_suggestions=5,
                 semantic_mode=sem_choice,
                 slug_w=slug_w, title_w=title_w, desc_w=desc_w, h1_w=h1_w, h2_w=h2_w, gsc_w=gsc_w,
-                existing_links=existing_links_ctx
+                existing_links=existing_links_ctx,
+                only_targets=None,
+                reason_filter=True   # only flagged
             )
             if sugg_df.empty:
-                st.info("No targets met the criteria for suggestions.")
+                st.info("No flagged targets met the criteria for suggestions.")
             else:
+                # If any row has no suggestions, surface a note inline
+                no_sugg = sugg_df["suggestions"].fillna("").eq("").sum()
+                if no_sugg > 0:
+                    st.warning(f"{no_sugg} target(s) had no strong sources (failed similarity/PR thresholds).")
                 st.markdown("**Compact view (one row per target)**")
                 st.dataframe(sugg_df, use_container_width=True)
-                st.download_button("Download compact CSV", sugg_df.to_csv(index=False).encode("utf-8"), "internal_link_suggestions_compact.csv", "text/csv")
+                st.download_button("Download compact CSV", sugg_df.to_csv(index=False).encode("utf-8"),
+                                   "internal_link_suggestions_compact.csv", "text/csv")
 
                 st.markdown("**Detailed view (one source per row)**")
                 long_df = explode_suggestions(sugg_df)
                 st.dataframe(long_df, use_container_width=True, height=min(900, 80 + 28*len(long_df)))
-                st.download_button("Download detailed CSV", long_df.to_csv(index=False).encode("utf-8"), "internal_link_suggestions_detailed.csv", "text/csv")
+                st.download_button("Download detailed CSV", long_df.to_csv(index=False).encode("utf-8"),
+                                   "internal_link_suggestions_detailed.csv", "text/csv")
+
+        with tabs[9]:
+            st.subheader("On-demand internal link suggestions")
+            q_url = st.text_input("Target URL (must be an internal HTTP 200 page)", value="", placeholder="https://www.example.com/path")
+            max_s = st.slider("Max suggestions", 1, 15, 7, 1)
+            min_sim_ui = st.slider("Min similarity", 0.0, 1.0, 0.45, 0.01)
+            min_pr_q_ui = st.slider("Min PR quantile (sources)", 0.0, 1.0, 0.60, 0.05)
+            run_now = st.button("Suggest links")
+
+            target_clean = normalize_url(q_url, keep_query=False)
+            if run_now and target_clean:
+                if target_clean not in df["url"].values:
+                    st.error("URL not found among analyzed HTTP 200 pages (check domain/normalization).")
+                else:
+                    on_demand = suggest_internal_links(
+                        df_metrics=df,
+                        components=components,
+                        combined_texts=combined_texts,
+                        category_map=cat_map,
+                        homepage_url=homepage_input,
+                        exclude_homepage_source=exclude_home_src,
+                        backlink_weight=0.10, pr_weight=0.50, ch_weight=0.10, sem_weight=0.30,
+                        use_link_budget=use_cap, cap_weight=cap_w,
+                        min_sim=float(min_sim_ui), min_pr_quantile=float(min_pr_q_ui), max_suggestions=int(max_s),
+                        semantic_mode=sem_choice,
+                        slug_w=slug_w, title_w=title_w, desc_w=desc_w, h1_w=h1_w, h2_w=h2_w, gsc_w=gsc_w,
+                        existing_links=existing_links_ctx,
+                        only_targets=[target_clean],
+                        reason_filter=False  # ignore flags; real-time
+                    )
+                    if on_demand.empty or on_demand["suggestions"].fillna("").eq("").all():
+                        st.info("No strong internal sources found (didn’t meet similarity/PR thresholds). Try lowering thresholds.")
+                    else:
+                        st.dataframe(on_demand, use_container_width=True)
+                        st.download_button("Download on-demand CSV",
+                                           on_demand.to_csv(index=False).encode("utf-8"),
+                                           "internal_link_suggestions_on_demand.csv", "text/csv")
 
         st.markdown("---")
         st.subheader("Download results")
